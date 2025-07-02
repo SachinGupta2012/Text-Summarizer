@@ -140,20 +140,6 @@ transformers
 PyYAML
 ```
 
-#### ⚙️ `render.yaml` (Optional)
-
-```yaml
-services:
-  - type: web
-    name: text-summarizer
-    env: python
-    buildCommand: "pip install -r requirements.txt"
-    startCommand: "streamlit run src/textSummarizer/app.py"
-    repo: https://github.com/YOUR_USERNAME/YOUR_REPO
-```
-
----
-
 ## 📊 Dataset
 
 We use the [SAMSum dataset](https://huggingface.co/datasets/samsum), which contains \~16k dialogue-summary pairs ideal for conversational summarization.
