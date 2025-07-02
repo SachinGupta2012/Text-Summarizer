@@ -1,0 +1,4 @@
+model_name: philschmid/bart-large-cnn-samsum
+sample_size: 100
+batch_size: 4
+epochs: 3
