@@ -1,0 +1,8 @@
+services:
+  - type: web
+    name: text-summarizer-streamlit
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: streamlit run app.py
+    env: python
+    region: oregon

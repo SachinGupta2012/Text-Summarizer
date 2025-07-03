@@ -116,21 +116,6 @@ Then open [http://localhost:8501](http://localhost:8501)
 
 ---
 
-### ☁️ 4. Deploy on Render
-
-#### 📋 `setup.sh`
-
-```bash
-mkdir -p ~/.streamlit/
-
-echo "\
-[server]\n\
-headless = true\n\
-port = $PORT\n\
-enableCORS = false\n\
-" > ~/.streamlit/config.toml
-```
-
 #### 🔧 `requirements.txt`
 
 ```
