@@ -165,8 +165,8 @@ Two friends discuss the new episode of Stranger Things.
 
 **ScreenShots**
 
-![Screenshot](images/Screenshot 2025-07-04 163844.png)
+![Screenshot](images/Screenshot_1.png)
 
-![Screenshot](images/Screenshot 2025-07-04 164043.png)
+![Screenshot](images/Screenshot_2.png)
 
 
