@@ -162,3 +162,10 @@ Two friends discuss the new episode of Stranger Things.
 ```
 
 ---
+
+**ScreenShots**
+
+![Screenshot](/home/sachingpt/text/Screenshot 2025-07-04 163844.png)
+![Screenshot](/home/sachingpt/text/Screenshot 2025-07-04 164043.png)
+
+
