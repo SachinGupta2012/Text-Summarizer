@@ -15,7 +15,6 @@ This is an **end-to-end abstractive text summarization project** using the **BAR
 │   ├── samsum-test.csv
 │   └── samsum-validation.csv     # Input dataset (SAMSum)
 │
-🔹 results/                       # Output directory for saved models or summaries
 │
 🔹 src/
 │   └── textSummarizer/
