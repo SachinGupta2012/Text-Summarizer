@@ -1,171 +1,101 @@
-# 📝 Text Summarizer using Transformers (BART on Samsum Dataset)
+# Transformer Summarizer
 
-This is an **end-to-end abstractive text summarization project** using the **BART-large-CNN model fine-tuned on the SAMSum dataset**. The project supports training, inference, and deployment via Streamlit on platforms like Render.
+A production-style learning project for multi-domain document summarization. The
+project will compare the untouched `Qwen/Qwen3-4B-Instruct-2507` model with a
+QLoRA adapter trained and evaluated on Kaggle GPU infrastructure.
 
----
+## Current status
 
-## 📁 Folder Structure
+**Phase 1: architecture and repository foundation.**
 
-```
-🔹 config/
-│   └── config.yaml                # Configuration file (model name, batch size, etc.)
-│
-🔹 data/
-│   ├── samsum-train.csv
-│   ├── samsum-test.csv
-│   └── samsum-validation.csv     # Input dataset (SAMSum)
-│
-│
-🔹 src/
-│   └── textSummarizer/
-│       ├── components/
-│       │   ├── data_loader.py     # Loads and processes datasets
-│       │   ├── infer.py           # Summarization logic
-│       │   ├── model_init.py      # Loads model & tokenizer
-│       │   ├── tokenizer.py       # Tokenizer utility
-│       │   └── trainer.py         # Model training code
-│       │
-│       ├── pipeline/
-│       │   └── train_pipeline.py  # Training pipeline script
-│       │
-│       ├── utils/
-│       │   ├── __init__.py
-│       │   └── common.py          # Utility functions
-│       │
-│       ├── app.py                 # Streamlit UI for summarization
-│       └── main.py                # Main orchestrator for CLI runs
-│
-🔹 requirements.txt               # Python dependencies
-🔹 setup.sh                       # Streamlit setup script for deployment
-🔹 README.md                      # Project documentation
+The repository currently contains runnable API and web service shells plus a
+dependency-light ML package. It does not yet download a dataset, load a model,
+train an adapter, accept documents, or generate summaries. Those capabilities
+have explicit later phases in [the roadmap](docs/roadmap.md).
+
+## Repository layout
+
+```text
+apps/web/              Next.js application
+services/api/          FastAPI service
+services/worker/       Reserved asynchronous worker boundary
+ml/                    Data, evaluation, training, and inference package
+packages/contracts/    Reserved generated API contracts
+infrastructure/        Container and optional observability configuration
+docs/                  Scope, architecture, roadmap, and decisions
+legacy/streamlit-poc/  Preserved original proof of concept
 ```
 
----
+## Architecture boundary
 
-## 💠 Features
-
-- ✅ Train a transformer model on the SAMSum dataset
-- ✅ Use pretrained model like `philschmid/bart-large-cnn-samsum`
-- ✅ Summarize long texts in real-time via Streamlit interface
-- ✅ Easily deployable to Render/Heroku
-- ✅ Configurable parameters via `config.yaml`
-
----
-
-## 🎞️ Installation
-
-```bash
-# Clone the repo
-git clone https://github.com/your-username/text-summarizer.git
-cd text-summarizer
-
-# Create virtual environment
-python -m venv venv
-source venv/bin/activate
-
-# Install dependencies
-pip install -r requirements.txt
+```text
+Next.js -> FastAPI -> asynchronous job -> worker -> document pipeline -> model
 ```
 
----
+PostgreSQL, Redis, document extraction, Qwen inference, and the worker are shown
+in the target architecture but are not implemented during Phase 1.
 
-## ⚙️ Configuration
+## Prerequisites
 
-Edit the `config/config.yaml` file:
+- Docker Desktop with Compose
+- Python 3.11 and `uv` for host-side Python development
+- Node.js 24 and pnpm 11 for host-side frontend development
 
-```yaml
-model_name: philschmid/bart-large-cnn-samsum
-sample_size: 100
-batch_size: 4
-epochs: 3
+On the development workstation, Docker Desktop's virtual disk is stored on the
+D: drive. The repository never assumes a machine-specific Docker path.
+
+## Run with Docker
+
+```powershell
+Copy-Item .env.example .env
+docker compose up --build
 ```
 
----
+Open:
 
-## 🚀 Usage
+- Web: <http://localhost:3000>
+- API documentation: <http://localhost:8000/docs>
+- API readiness: <http://localhost:8000/health/ready>
 
-### ▶️ 1. Train the Model
+Stop the service shells with:
 
-```bash
-python src/textSummarizer/pipeline/train_pipeline.py
+```powershell
+docker compose down
 ```
 
----
+Phase 1 creates no database or persistent Docker volume.
 
-### 🧪 2. Run Inference via Script
+## Host-side development
 
-```python
-from src.textSummarizer.components.model_init import load_model
-from src.textSummarizer.components.infer import summarize
+```powershell
+uv sync --all-packages --group dev
+uv run pytest
+uv run ruff check .
+uv run ruff format --check .
+uv run mypy services/api/src ml/src
 
-tokenizer, model = load_model("philschmid/bart-large-cnn-samsum")
-text = "Your input text here..."
-print(summarize(text, model, tokenizer))
+pnpm install --frozen-lockfile
+pnpm lint
+pnpm typecheck
+pnpm test
+pnpm build
 ```
 
----
+## Documentation
 
-### 🌐 3. Run Streamlit App (Locally)
+- [Phase 1 implementation record](docs/phase-1-implementation.md)
+- [Product scope](docs/product-scope.md)
+- [Phased roadmap](docs/roadmap.md)
+- [System overview](docs/architecture/system-overview.md)
+- [Component architecture](docs/architecture/component-architecture.md)
+- [ML lifecycle](docs/architecture/ml-lifecycle.md)
+- [Storage and retention](docs/architecture/storage-and-retention.md)
+- [Security boundaries](docs/architecture/security-boundaries.md)
 
-```bash
-streamlit run src/textSummarizer/app.py
-```
+## Legacy proof of concept
 
-Then open [http://localhost:8501](http://localhost:8501)
-
----
-
-#### 🔧 `requirements.txt`
-
-```
-streamlit
-torch
-transformers
-PyYAML
-```
-
-## 📊 Dataset
-
-We use the [SAMSum dataset](https://huggingface.co/datasets/samsum), which contains \~16k dialogue-summary pairs ideal for conversational summarization.
-
----
-
-## 🧠 Model Info
-
-Model: [`philschmid/bart-large-cnn-samsum`](https://huggingface.co/philschmid/bart-large-cnn-samsum)\
-Base: `facebook/bart-large-cnn`
-
----
-
-## 🙇‍♂️ Author
-
-- **Your Name**
-- Email: [sachinguptadec03@email.com](mailto\:your@email.com)
-- GitHub: [@SachinGupta2012](https://github.com/your-handle)
-
----
-
-## 🖼️ Example
-
-**Input**:
-
-```
-A: Hey! Did you watch the new episode of Stranger Things?
-B: Yes! It was amazing!
-```
-
-**Summary**:
-
-```
-Two friends discuss the new episode of Stranger Things.
-```
-
----
-
-**ScreenShots**
-
-![Screenshot](images/Screenshot_1.png)
-
-![Screenshot](images/Screenshot_2.png)
-
-
+The original Streamlit/SAMSum implementation is preserved under
+[`legacy/streamlit-poc`](legacy/streamlit-poc). The Git tag
+`legacy-streamlit-poc` points to the exact pre-refactor commit. Legacy code and
+datasets are excluded from the new dependency graph, Docker context, tests, and
+CI.

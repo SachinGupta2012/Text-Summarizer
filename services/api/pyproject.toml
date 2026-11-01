@@ -1,0 +1,18 @@
+[project]
+name = "summarizer-api"
+version = "0.1.0"
+description = "HTTP API foundation for the transformer summarization platform"
+readme = "README.md"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+  "fastapi>=0.115.12,<0.116",
+  "pydantic-settings>=2.7,<3",
+  "uvicorn[standard]>=0.34,<0.35",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/summarizer_api"]
