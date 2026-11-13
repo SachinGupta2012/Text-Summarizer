@@ -44,6 +44,29 @@ class Phase3RunResult(BaseModel):
     token_analysis: TokenAnalysisReport
 
 
+def resume_phase3_token_analysis(
+    *,
+    output_directory: Path,
+    tokenizer: Tokenizer,
+    tokenizer_id: str,
+    token_batch_size: int = 256,
+    token_progress_every: int = 10_000,
+    token_progress_callback: ProgressCallback | None = None,
+) -> TokenAnalysisReport:
+    """Resume token analysis from its JSONL checkpoint without preprocessing again."""
+
+    return analyze_token_lengths_stream(
+        iter_processed_records(output_directory),
+        tokenizer,
+        tokenizer_id,
+        output_directory / "analysis",
+        batch_size=token_batch_size,
+        progress_every=token_progress_every,
+        progress_callback=token_progress_callback,
+        resume=True,
+    )
+
+
 def _all_raw_records(
     cnn_dailymail: DatasetSplits,
     govreport: DatasetSplits,
@@ -102,6 +125,9 @@ def run_phase3_diagnostic(
     max_records_per_dataset_split: int | None = None,
     progress_every: int = 10_000,
     progress_callback: ProgressCallback | None = None,
+    token_batch_size: int = 256,
+    token_progress_every: int = 10_000,
+    token_progress_callback: ProgressCallback | None = None,
 ) -> Phase3RunResult:
     """Normalize all five sources, audit exact leakage, and measure Qwen lengths."""
 
@@ -131,11 +157,13 @@ def run_phase3_diagnostic(
     finally:
         processor.close()
 
-    token_report = analyze_token_lengths_stream(
-        iter_processed_records(output_directory),
-        tokenizer,
-        tokenizer_id,
-        output_directory / "analysis",
+    token_report = resume_phase3_token_analysis(
+        output_directory=output_directory,
+        tokenizer=tokenizer,
+        tokenizer_id=tokenizer_id,
+        token_batch_size=token_batch_size,
+        token_progress_every=token_progress_every,
+        token_progress_callback=token_progress_callback,
     )
     return Phase3RunResult(
         output_directory=output_directory,

@@ -52,6 +52,50 @@ class WhitespaceTokenizer:
         del add_special_tokens
         return list(range(len(text.split())))
 
+    def __call__(
+        self,
+        text: list[str],
+        *,
+        add_special_tokens: bool = False,
+        padding: bool = False,
+        truncation: bool = False,
+        return_length: bool = False,
+    ) -> dict[str, object]:
+        del add_special_tokens, padding, truncation
+        if not return_length:
+            raise AssertionError("The preprocessing pipeline must request batch lengths.")
+        return {"length": [len(value.split()) for value in text]}
+
+
+class CountingWhitespaceTokenizer(WhitespaceTokenizer):
+    """Tokenizer double that records single and batched encoding calls."""
+
+    def __init__(self) -> None:
+        self.encoded_texts: list[str] = []
+        self.batch_sizes: list[int] = []
+
+    def encode(self, text: str, *, add_special_tokens: bool = False) -> list[int]:
+        self.encoded_texts.append(text)
+        return super().encode(text, add_special_tokens=add_special_tokens)
+
+    def __call__(
+        self,
+        text: list[str],
+        *,
+        add_special_tokens: bool = False,
+        padding: bool = False,
+        truncation: bool = False,
+        return_length: bool = False,
+    ) -> dict[str, object]:
+        self.batch_sizes.append(len(text))
+        return super().__call__(
+            text,
+            add_special_tokens=add_special_tokens,
+            padding=padding,
+            truncation=truncation,
+            return_length=return_length,
+        )
+
 
 def _accepted(record: RawRecord) -> ProcessedRecord:
     result = preprocess_record(record)
@@ -364,6 +408,15 @@ def test_token_measurement_includes_query_in_model_input() -> None:
     assert measurement.summary_tokens == 4
 
 
+def test_token_measurement_reuses_source_length_without_query() -> None:
+    tokenizer = CountingWhitespaceTokenizer()
+
+    measurement = measure_token_lengths(_accepted(_article_record()), tokenizer)
+
+    assert measurement.input_tokens == measurement.source_tokens
+    assert len(tokenizer.encoded_texts) == 2
+
+
 def test_token_analysis_reports_percentiles_and_threshold_counts() -> None:
     records = [
         _accepted(_article_record(source_id="one")),
@@ -395,21 +448,83 @@ def test_token_analysis_reports_percentiles_and_threshold_counts() -> None:
 
 def test_streaming_token_analysis_writes_lengths_and_report(tmp_path: Path) -> None:
     output_directory = tmp_path / "token-analysis"
+    tokenizer = CountingWhitespaceTokenizer()
+    progress: list[int] = []
 
     report = analyze_token_lengths_stream(
         [_accepted(_article_record())],
-        WhitespaceTokenizer(),
+        tokenizer,
         tokenizer_id="test/whitespace",
         output_directory=output_directory,
         thresholds=(5,),
+        batch_size=8,
+        progress_every=1,
+        progress_callback=progress.append,
     )
 
     assert report.overall.input_tokens.count == 1
+    assert tokenizer.batch_sizes == [1, 1]
+    assert progress == [1]
     assert (output_directory / "token-lengths.jsonl").is_file()
     saved_report = json.loads(
         (output_directory / "token-analysis-report.json").read_text(encoding="utf-8")
     )
     assert saved_report["tokenizer_id"] == "test/whitespace"
+
+
+def test_streaming_token_analysis_resumes_checkpoint_in_batches(tmp_path: Path) -> None:
+    output_directory = tmp_path / "token-analysis"
+    first = _accepted(_article_record(source_id="first"))
+    second = _accepted(_article_record(source_id="second"))
+
+    analyze_token_lengths_stream(
+        [first],
+        WhitespaceTokenizer(),
+        tokenizer_id="test/whitespace",
+        output_directory=output_directory,
+        batch_size=2,
+    )
+    (output_directory / "token-analysis-report.json").unlink()
+
+    progress: list[int] = []
+    report = analyze_token_lengths_stream(
+        [first, second],
+        WhitespaceTokenizer(),
+        tokenizer_id="test/whitespace",
+        output_directory=output_directory,
+        batch_size=2,
+        progress_every=1,
+        progress_callback=progress.append,
+    )
+
+    lines = (output_directory / "token-lengths.jsonl").read_text(encoding="utf-8").splitlines()
+    assert report.overall.input_tokens.count == 2
+    assert len(lines) == 2
+    assert progress == [1, 2]
+
+
+def test_streaming_token_analysis_batches_only_query_specific_extra_work(
+    tmp_path: Path,
+) -> None:
+    tokenizer = CountingWhitespaceTokenizer()
+    records = [
+        _accepted(_article_record(source_id="document")),
+        _accepted(
+            _article_record(source_id="query").model_copy(
+                update={"query": "What happened in this article?"}
+            )
+        ),
+    ]
+
+    analyze_token_lengths_stream(
+        records,
+        tokenizer,
+        tokenizer_id="test/whitespace",
+        output_directory=tmp_path / "token-analysis",
+        batch_size=8,
+    )
+
+    assert tokenizer.batch_sizes == [2, 2, 1, 1]
 
 
 def test_hugging_face_source_iterator_maps_supported_splits() -> None:
@@ -520,7 +635,7 @@ def test_phase3_runner_processes_all_five_sources(tmp_path: Path) -> None:
                     "tweet_ids_sentence_offset": [{"tweet_id": 10}, {"tweet_id": 11}],
                     "annotations": [
                         {"abstractive": None},
-                        {"abstractive": ["The customer received a replacement order."]}
+                        {"abstractive": ["The customer received a replacement order."]},
                     ],
                 }
             )
@@ -534,6 +649,7 @@ def test_phase3_runner_processes_all_five_sources(tmp_path: Path) -> None:
     )
 
     progress_updates: list[int] = []
+    token_progress_updates: list[int] = []
     result = run_phase3_diagnostic(
         cnn_dailymail={
             "train": [
@@ -572,6 +688,9 @@ def test_phase3_runner_processes_all_five_sources(tmp_path: Path) -> None:
         max_records_per_dataset_split=2,
         progress_every=2,
         progress_callback=progress_updates.append,
+        token_batch_size=2,
+        token_progress_every=2,
+        token_progress_callback=token_progress_updates.append,
     )
 
     assert result.processing.input_records == 6
@@ -579,6 +698,7 @@ def test_phase3_runner_processes_all_five_sources(tmp_path: Path) -> None:
     assert result.processing.rejected_records == 1
     assert result.processing.rejected_by_reason == {"empty_summary": 1}
     assert progress_updates == [2, 4, 6]
+    assert token_progress_updates == [2, 4, 5]
     assert set(result.processing.accepted_by_dataset) == {
         "billsum",
         "cnn_dailymail",

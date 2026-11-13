@@ -12,7 +12,11 @@ from summarizer_ml.preprocessing.models import (
     Split,
 )
 from summarizer_ml.preprocessing.pipeline import PreprocessingConfig, preprocess_record
-from summarizer_ml.preprocessing.runner import Phase3RunResult, run_phase3_diagnostic
+from summarizer_ml.preprocessing.runner import (
+    Phase3RunResult,
+    resume_phase3_token_analysis,
+    run_phase3_diagnostic,
+)
 from summarizer_ml.preprocessing.tokenization import (
     TokenAnalysisReport,
     TokenLengthRecord,
@@ -39,5 +43,6 @@ __all__ = [
     "analyze_token_lengths_stream",
     "measure_token_lengths",
     "preprocess_record",
+    "resume_phase3_token_analysis",
     "run_phase3_diagnostic",
 ]
