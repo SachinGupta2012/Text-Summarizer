@@ -83,7 +83,7 @@ def _prepare_records(
         if progress_callback is not None and emitted % progress_every == 0:
             progress_callback(emitted)
 
-    if progress_callback is not None:
+    if progress_callback is not None and emitted % progress_every != 0:
         progress_callback(emitted)
 
 

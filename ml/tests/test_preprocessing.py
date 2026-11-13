@@ -229,6 +229,40 @@ def test_tweetsumm_adapter_rejects_missing_tweets() -> None:
         raise AssertionError("Expected missing TweetSumm rows to be rejected.")
 
 
+def test_tweetsumm_null_summary_is_audited_without_losing_valid_references() -> None:
+    entry = {
+        "conversation_id": "conversation-with-missing-summary",
+        "tweet_ids_sentence_offset": [{"tweet_id": 10}, {"tweet_id": 11}],
+        "annotations": [
+            {"abstractive": None},
+            {"abstractive": ["The customer received help from the support agent."]},
+        ],
+    }
+    tweet_lookup = {
+        "10": TweetRow(
+            tweet_id="10",
+            inbound=True,
+            text="I need detailed assistance with my delayed order.",
+        ),
+        "11": TweetRow(
+            tweet_id="11",
+            inbound=False,
+            text="I can investigate the order and provide an update.",
+        ),
+    }
+
+    records = adapt_tweetsumm(entry, Split.TRAIN, tweet_lookup)
+    missing_outcome = preprocess_record(records[0])
+    valid_outcome = preprocess_record(records[1])
+
+    assert len(records) == 2
+    assert records[0].metadata["summary_missing"] is True
+    assert isinstance(missing_outcome, RejectedRecord)
+    assert missing_outcome.reason is RejectionReason.EMPTY_SUMMARY
+    assert records[1].metadata["summary_missing"] is False
+    assert isinstance(valid_outcome, ProcessedRecord)
+
+
 def test_load_selected_tweets_streams_only_requested_rows(tmp_path: Path) -> None:
     csv_path = tmp_path / "twcs.csv"
     csv_path.write_text(
@@ -485,6 +519,7 @@ def test_phase3_runner_processes_all_five_sources(tmp_path: Path) -> None:
                     "conversation_id": "conversation-1",
                     "tweet_ids_sentence_offset": [{"tweet_id": 10}, {"tweet_id": 11}],
                     "annotations": [
+                        {"abstractive": None},
                         {"abstractive": ["The customer received a replacement order."]}
                     ],
                 }
@@ -534,14 +569,16 @@ def test_phase3_runner_processes_all_five_sources(tmp_path: Path) -> None:
         tokenizer=WhitespaceTokenizer(),
         tokenizer_id="test/whitespace",
         output_directory=tmp_path / "phase3-output",
-        max_records_per_dataset_split=1,
+        max_records_per_dataset_split=2,
         progress_every=2,
         progress_callback=progress_updates.append,
     )
 
-    assert result.processing.input_records == 5
+    assert result.processing.input_records == 6
     assert result.processing.accepted_records == 5
-    assert progress_updates == [2, 4, 5]
+    assert result.processing.rejected_records == 1
+    assert result.processing.rejected_by_reason == {"empty_summary": 1}
+    assert progress_updates == [2, 4, 6]
     assert set(result.processing.accepted_by_dataset) == {
         "billsum",
         "cnn_dailymail",

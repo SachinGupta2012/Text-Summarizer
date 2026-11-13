@@ -210,11 +210,14 @@ def adapt_tweetsumm(
     group_id = f"tweetsumm:{conversation_id}"
     for index, annotation in enumerate(annotations):
         abstractive = annotation.get("abstractive")
-        if not isinstance(abstractive, Sequence) or isinstance(abstractive, str):
+        if abstractive is None:
+            summary_text = ""
+        elif not isinstance(abstractive, Sequence) or isinstance(abstractive, str):
             raise AdapterError("TweetSumm abstractive summary must be a list of strings.")
-        if not all(isinstance(sentence, str) for sentence in abstractive):
-            raise AdapterError("TweetSumm abstractive summary contains a non-string value.")
-        summary_text = " ".join(abstractive)
+        else:
+            if not all(isinstance(sentence, str) for sentence in abstractive):
+                raise AdapterError("TweetSumm abstractive summary contains a non-string value.")
+            summary_text = " ".join(abstractive)
         records.append(
             RawRecord(
                 dataset=DatasetName.TWEETSUMM,
@@ -229,6 +232,7 @@ def adapt_tweetsumm(
                     "conversation_id": conversation_id,
                     "reference_index": index,
                     "reference_count": len(annotations),
+                    "summary_missing": abstractive is None,
                     "tweet_ids": tweet_ids,
                 },
             )
