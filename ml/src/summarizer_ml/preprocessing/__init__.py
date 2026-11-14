@@ -26,6 +26,18 @@ from summarizer_ml.preprocessing.outliers import (
     audit_outliers,
 )
 from summarizer_ml.preprocessing.pipeline import PreprocessingConfig, preprocess_record
+from summarizer_ml.preprocessing.policy import (
+    ArtifactDigest,
+    Phase3IntegrityGates,
+    Phase3Manifest,
+    Phase3PolicyConfig,
+    Phase3PolicyResult,
+    PolicyAction,
+    PolicyDecision,
+    PolicyReason,
+    classify_outlier,
+    materialize_training_ready_partitions,
+)
 from summarizer_ml.preprocessing.runner import (
     Phase3RunResult,
     resume_phase3_token_analysis,
@@ -40,6 +52,7 @@ from summarizer_ml.preprocessing.tokenization import (
 )
 
 __all__ = [
+    "ArtifactDigest",
     "DatasetName",
     "Domain",
     "FinalizationReport",
@@ -50,7 +63,14 @@ __all__ = [
     "OutlierAuditResult",
     "OutlierFlag",
     "OutlierRecord",
+    "Phase3IntegrityGates",
+    "Phase3Manifest",
+    "Phase3PolicyConfig",
+    "Phase3PolicyResult",
     "Phase3RunResult",
+    "PolicyAction",
+    "PolicyDecision",
+    "PolicyReason",
     "PreprocessingConfig",
     "ProcessedRecord",
     "QualityFlag",
@@ -64,7 +84,9 @@ __all__ = [
     "analyze_token_lengths",
     "analyze_token_lengths_stream",
     "audit_outliers",
+    "classify_outlier",
     "materialize_leakage_safe_partitions",
+    "materialize_training_ready_partitions",
     "measure_token_lengths",
     "preprocess_record",
     "resume_phase3_token_analysis",

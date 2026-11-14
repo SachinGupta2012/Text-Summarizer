@@ -30,8 +30,19 @@ from summarizer_ml.preprocessing.models import (
     RejectionReason,
     Split,
 )
-from summarizer_ml.preprocessing.outliers import OutlierAuditConfig, audit_outliers
+from summarizer_ml.preprocessing.outliers import (
+    OutlierAuditConfig,
+    OutlierRecord,
+    audit_outliers,
+)
 from summarizer_ml.preprocessing.pipeline import PreprocessingConfig, preprocess_record
+from summarizer_ml.preprocessing.policy import (
+    Phase3PolicyConfig,
+    PolicyAction,
+    PolicyReason,
+    classify_outlier,
+    materialize_training_ready_partitions,
+)
 from summarizer_ml.preprocessing.runner import run_phase3_diagnostic
 from summarizer_ml.preprocessing.sources import (
     iter_huggingface_records,
@@ -453,8 +464,8 @@ def test_leakage_safe_finalization_preserves_validation_and_removes_train(
     audit = audit_outliers(
         result.final_directory,
         config=OutlierAuditConfig(
-            extreme_input_tokens=5,
-            extreme_summary_tokens=3,
+            extreme_input_tokens=8,
+            extreme_summary_tokens=100,
             very_short_input_tokens=1,
             very_short_summary_tokens=1,
             top_k_per_metric=1,
@@ -465,8 +476,8 @@ def test_leakage_safe_finalization_preserves_validation_and_removes_train(
     assert audit.report.total_processed_records == 3
     assert audit.report.total_token_records == 3
     assert audit.report.selected_outlier_records == 3
-    assert audit.report.flags["extreme_input"] == 3
-    assert audit.report.flags["extreme_summary"] == 3
+    assert audit.report.flags["extreme_input"] == 2
+    assert "extreme_summary" not in audit.report.flags
     assert audit.report.by_dataset["cnn_dailymail"].total_records == 3
     assert len(audit.report.overall.top_input_tokens) == 1
     assert progress == [
@@ -486,6 +497,96 @@ def test_leakage_safe_finalization_preserves_validation_and_removes_train(
         config=audit.report.config,
     )
     assert repeated_audit == audit
+
+    canonical_report_before = (result.final_directory / "finalization-report.json").read_bytes()
+    policy_progress: list[tuple[str, int]] = []
+    policy = materialize_training_ready_partitions(
+        result.final_directory,
+        config=Phase3PolicyConfig(
+            direct_input_token_limit=8,
+            direct_summary_token_limit=100,
+            minimum_input_tokens=1,
+            minimum_summary_tokens=1,
+        ),
+        progress_every=2,
+        progress_callback=lambda stage, count: policy_progress.append((stage, count)),
+    )
+    assert policy.manifest.canonical_records == 3
+    assert policy.manifest.canonical_token_records == 3
+    assert policy.manifest.training_ready_records == 1
+    assert policy.manifest.training_ready_token_records == 1
+    assert policy.manifest.routed_records == 2
+    assert policy.manifest.by_action == {"keep": 1, "requires_chunking": 2}
+    assert policy.manifest.integrity.cross_split_leakage_findings == 0
+    assert policy.manifest.integrity.canonical_files_unchanged
+    assert policy_progress == [
+        ("record_policy", 2),
+        ("record_policy", 3),
+        ("token_policy", 2),
+        ("token_policy", 3),
+    ]
+    training_records = list(iter_processed_records(policy.output_directory))
+    assert [record.source_id for record in training_records] == ["safe-test"]
+    routed_lines = (
+        (policy.output_directory / "routing" / "requires_chunking.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    )
+    assert len(routed_lines) == 2
+    assert (result.final_directory / "finalization-report.json").read_bytes() == (
+        canonical_report_before
+    )
+    repeated_policy = materialize_training_ready_partitions(
+        result.final_directory,
+        config=policy.manifest.policy,
+    )
+    assert repeated_policy == policy
+
+
+def test_outlier_policy_uses_conservative_action_precedence() -> None:
+    base = OutlierRecord(
+        record_id="a" * 64,
+        dataset="govreport",
+        split="train",
+        source_id="source",
+        group_id="group",
+        query_type="document",
+        source_tokens=100,
+        query_tokens=0,
+        input_tokens=100,
+        summary_tokens=20,
+        source_characters=500,
+        summary_characters=100,
+        summary_to_input_ratio=0.2,
+        quality_flags=(),
+        audit_flags=(),
+        query=None,
+        metadata={},
+    )
+    config = Phase3PolicyConfig(
+        direct_input_token_limit=50,
+        direct_summary_token_limit=10,
+        minimum_input_tokens=5,
+        minimum_summary_tokens=2,
+    )
+
+    action, reasons = classify_outlier(base, config)
+    assert action is PolicyAction.LONG_TARGET
+    assert reasons == (
+        PolicyReason.INPUT_EXCEEDS_DIRECT_LIMIT,
+        PolicyReason.SUMMARY_EXCEEDS_DIRECT_LIMIT,
+    )
+
+    quarantined = base.model_copy(update={"input_tokens": 4, "summary_tokens": 20})
+    action, reasons = classify_outlier(quarantined, config)
+    assert action is PolicyAction.QUARANTINE
+    assert PolicyReason.INPUT_BELOW_MINIMUM in reasons
+    assert PolicyReason.SUMMARY_LONGER_THAN_INPUT in reasons
+
+    chunked = base.model_copy(update={"summary_tokens": 5})
+    action, reasons = classify_outlier(chunked, config)
+    assert action is PolicyAction.REQUIRES_CHUNKING
+    assert reasons == (PolicyReason.INPUT_EXCEEDS_DIRECT_LIMIT,)
 
 
 def test_token_measurement_includes_query_in_model_input() -> None:
