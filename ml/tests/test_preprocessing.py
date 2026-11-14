@@ -19,6 +19,7 @@ from summarizer_ml.preprocessing.deduplication import (
     deduplicate_exact,
     find_split_leakage,
 )
+from summarizer_ml.preprocessing.finalization import materialize_leakage_safe_partitions
 from summarizer_ml.preprocessing.models import (
     DatasetName,
     Domain,
@@ -388,6 +389,64 @@ def test_streaming_preprocessor_refuses_nonempty_output_directory(tmp_path: Path
         assert "not empty" in str(error)
     else:
         raise AssertionError("Expected non-empty output directory to be rejected.")
+
+
+def test_leakage_safe_finalization_preserves_validation_and_removes_train(
+    tmp_path: Path,
+) -> None:
+    diagnostic_directory = tmp_path / "diagnostic"
+    shared_source = "A shared article contains enough detailed text to pass validation safely."
+    raw_records = [
+        _article_record(source_id="safe-train").model_copy(
+            update={
+                "source_text": (
+                    "A unique training article contains detailed information for testing."
+                )
+            }
+        ),
+        _article_record(source_id="leaked-train").model_copy(update={"source_text": shared_source}),
+        _article_record(split=Split.VALIDATION, source_id="leaked-validation").model_copy(
+            update={"source_text": shared_source}
+        ),
+        _article_record(split=Split.TEST, source_id="safe-test").model_copy(
+            update={"source_text": "A unique test article contains separate factual information."}
+        ),
+    ]
+    with StreamingPreprocessor(diagnostic_directory) as processor:
+        processor.process(raw_records)
+        diagnostic_report = processor.finalize()
+    analyze_token_lengths_stream(
+        iter_processed_records(diagnostic_directory),
+        WhitespaceTokenizer(),
+        tokenizer_id="test/whitespace",
+        output_directory=diagnostic_directory / "analysis",
+    )
+
+    result = materialize_leakage_safe_partitions(diagnostic_directory)
+    final_records = list(iter_processed_records(result.final_directory))
+
+    assert diagnostic_report.accepted_records == 4
+    assert diagnostic_report.leakage_findings == 1
+    assert result.report.leakage_findings_before == 1
+    assert result.report.leakage_removals == 1
+    assert result.report.leakage_findings_after == 0
+    assert result.report.final_records == 3
+    assert result.report.final_token_records == 3
+    assert result.report.final_by_split == {"test": 1, "train": 1, "validation": 1}
+    assert {record.source_id for record in final_records} == {
+        "safe-train",
+        "leaked-validation",
+        "safe-test",
+    }
+    audit_lines = (result.final_directory / "audit" / "leakage-removals.jsonl").read_text(
+        encoding="utf-8"
+    )
+    audit_record = json.loads(audit_lines)
+    assert audit_record["finding_kind"] == "source_hash"
+    assert audit_record["removed_split"] == "train"
+    assert audit_record["retained_split"] == "validation"
+    repeated = materialize_leakage_safe_partitions(diagnostic_directory)
+    assert repeated == result
 
 
 def test_token_measurement_includes_query_in_model_input() -> None:

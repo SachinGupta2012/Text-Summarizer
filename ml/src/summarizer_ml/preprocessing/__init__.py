@@ -1,5 +1,11 @@
 """Reusable Phase 3 preprocessing primitives."""
 
+from summarizer_ml.preprocessing.finalization import (
+    FinalizationReport,
+    FinalizationResult,
+    LeakageRemoval,
+    materialize_leakage_safe_partitions,
+)
 from summarizer_ml.preprocessing.models import (
     DatasetName,
     Domain,
@@ -28,6 +34,9 @@ from summarizer_ml.preprocessing.tokenization import (
 __all__ = [
     "DatasetName",
     "Domain",
+    "FinalizationReport",
+    "FinalizationResult",
+    "LeakageRemoval",
     "Phase3RunResult",
     "PreprocessingConfig",
     "ProcessedRecord",
@@ -41,6 +50,7 @@ __all__ = [
     "TokenLengthRecord",
     "analyze_token_lengths",
     "analyze_token_lengths_stream",
+    "materialize_leakage_safe_partitions",
     "measure_token_lengths",
     "preprocess_record",
     "resume_phase3_token_analysis",

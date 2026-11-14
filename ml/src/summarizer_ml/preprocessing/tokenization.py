@@ -133,36 +133,38 @@ def analyze_token_lengths(
     """Measure records and produce overall plus per-dataset distributions."""
 
     measurements: list[TokenLengthRecord] = []
-    grouped_inputs: dict[str, list[int]] = defaultdict(list)
-    grouped_summaries: dict[str, list[int]] = defaultdict(list)
     for record in records:
         measurement = measure_token_lengths(record, tokenizer)
         measurements.append(measurement)
-        grouped_inputs[measurement.dataset].append(measurement.input_tokens)
-        grouped_summaries[measurement.dataset].append(measurement.summary_tokens)
 
     if not measurements:
         raise ValueError("No records were supplied for token analysis.")
-
-    all_inputs = [measurement.input_tokens for measurement in measurements]
-    all_summaries = [measurement.summary_tokens for measurement in measurements]
-    by_dataset = {
-        dataset: DatasetTokenStatistics(
-            input_tokens=_distribution(grouped_inputs[dataset], thresholds),
-            summary_tokens=_distribution(grouped_summaries[dataset], thresholds),
-        )
-        for dataset in sorted(grouped_inputs)
-    }
-    report = TokenAnalysisReport(
-        tokenizer_id=tokenizer_id,
-        thresholds=thresholds,
-        overall=DatasetTokenStatistics(
-            input_tokens=_distribution(all_inputs, thresholds),
-            summary_tokens=_distribution(all_summaries, thresholds),
-        ),
-        by_dataset=by_dataset,
-    )
+    report = summarize_token_length_records(measurements, tokenizer_id, thresholds)
     return tuple(measurements), report
+
+
+def summarize_token_length_records(
+    measurements: Iterable[TokenLengthRecord],
+    tokenizer_id: str,
+    thresholds: tuple[int, ...] = (4_096, 8_192, 16_384, 32_768),
+) -> TokenAnalysisReport:
+    """Build token distributions from an existing measurement stream."""
+
+    grouped_inputs: dict[str, list[int]] = defaultdict(list)
+    grouped_summaries: dict[str, list[int]] = defaultdict(list)
+    measurement_count = 0
+    for measurement in measurements:
+        grouped_inputs[measurement.dataset].append(measurement.input_tokens)
+        grouped_summaries[measurement.dataset].append(measurement.summary_tokens)
+        measurement_count += 1
+    if measurement_count == 0:
+        raise ValueError("No token-length records were supplied for analysis.")
+    return _build_token_analysis_report(
+        grouped_inputs,
+        grouped_summaries,
+        tokenizer_id,
+        thresholds,
+    )
 
 
 def analyze_token_lengths_stream(
@@ -255,9 +257,28 @@ def analyze_token_lengths_stream(
         lengths_path.unlink()
         raise ValueError("No records were supplied for token analysis.")
 
+    report = _build_token_analysis_report(
+        grouped_inputs,
+        grouped_summaries,
+        tokenizer_id,
+        thresholds,
+    )
+    report_path.write_text(
+        json.dumps(report.model_dump(mode="json"), indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return report
+
+
+def _build_token_analysis_report(
+    grouped_inputs: Mapping[str, list[int]],
+    grouped_summaries: Mapping[str, list[int]],
+    tokenizer_id: str,
+    thresholds: tuple[int, ...],
+) -> TokenAnalysisReport:
     all_inputs = [value for values in grouped_inputs.values() for value in values]
     all_summaries = [value for values in grouped_summaries.values() for value in values]
-    report = TokenAnalysisReport(
+    return TokenAnalysisReport(
         tokenizer_id=tokenizer_id,
         thresholds=thresholds,
         overall=DatasetTokenStatistics(
@@ -272,11 +293,6 @@ def analyze_token_lengths_stream(
             for dataset in sorted(grouped_inputs)
         },
     )
-    report_path.write_text(
-        json.dumps(report.model_dump(mode="json"), indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
-    return report
 
 
 def _batched(
