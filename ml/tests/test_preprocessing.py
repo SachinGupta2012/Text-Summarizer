@@ -30,6 +30,7 @@ from summarizer_ml.preprocessing.models import (
     RejectionReason,
     Split,
 )
+from summarizer_ml.preprocessing.outliers import OutlierAuditConfig, audit_outliers
 from summarizer_ml.preprocessing.pipeline import PreprocessingConfig, preprocess_record
 from summarizer_ml.preprocessing.runner import run_phase3_diagnostic
 from summarizer_ml.preprocessing.sources import (
@@ -447,6 +448,44 @@ def test_leakage_safe_finalization_preserves_validation_and_removes_train(
     assert audit_record["retained_split"] == "validation"
     repeated = materialize_leakage_safe_partitions(diagnostic_directory)
     assert repeated == result
+
+    progress: list[tuple[str, int]] = []
+    audit = audit_outliers(
+        result.final_directory,
+        config=OutlierAuditConfig(
+            extreme_input_tokens=5,
+            extreme_summary_tokens=3,
+            very_short_input_tokens=1,
+            very_short_summary_tokens=1,
+            top_k_per_metric=1,
+        ),
+        progress_every=2,
+        progress_callback=lambda stage, count: progress.append((stage, count)),
+    )
+    assert audit.report.total_processed_records == 3
+    assert audit.report.total_token_records == 3
+    assert audit.report.selected_outlier_records == 3
+    assert audit.report.flags["extreme_input"] == 3
+    assert audit.report.flags["extreme_summary"] == 3
+    assert audit.report.by_dataset["cnn_dailymail"].total_records == 3
+    assert len(audit.report.overall.top_input_tokens) == 1
+    assert progress == [
+        ("token_scan", 2),
+        ("token_scan", 3),
+        ("partition_scan", 2),
+        ("partition_scan", 3),
+        ("token_join", 2),
+        ("token_join", 3),
+    ]
+    outlier_lines = (
+        (audit.output_directory / "outlier-records.jsonl").read_text(encoding="utf-8").splitlines()
+    )
+    assert len(outlier_lines) == 3
+    repeated_audit = audit_outliers(
+        result.final_directory,
+        config=audit.report.config,
+    )
+    assert repeated_audit == audit
 
 
 def test_token_measurement_includes_query_in_model_input() -> None:

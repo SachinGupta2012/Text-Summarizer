@@ -17,6 +17,14 @@ from summarizer_ml.preprocessing.models import (
     RejectionReason,
     Split,
 )
+from summarizer_ml.preprocessing.outliers import (
+    OutlierAuditConfig,
+    OutlierAuditReport,
+    OutlierAuditResult,
+    OutlierFlag,
+    OutlierRecord,
+    audit_outliers,
+)
 from summarizer_ml.preprocessing.pipeline import PreprocessingConfig, preprocess_record
 from summarizer_ml.preprocessing.runner import (
     Phase3RunResult,
@@ -37,6 +45,11 @@ __all__ = [
     "FinalizationReport",
     "FinalizationResult",
     "LeakageRemoval",
+    "OutlierAuditConfig",
+    "OutlierAuditReport",
+    "OutlierAuditResult",
+    "OutlierFlag",
+    "OutlierRecord",
     "Phase3RunResult",
     "PreprocessingConfig",
     "ProcessedRecord",
@@ -50,6 +63,7 @@ __all__ = [
     "TokenLengthRecord",
     "analyze_token_lengths",
     "analyze_token_lengths_stream",
+    "audit_outliers",
     "materialize_leakage_safe_partitions",
     "measure_token_lengths",
     "preprocess_record",
