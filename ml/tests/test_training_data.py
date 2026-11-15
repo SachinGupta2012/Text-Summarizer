@@ -1,6 +1,7 @@
 """Tests for model-specific Qwen3 SFT dataset construction."""
 
 import json
+import tarfile
 from collections.abc import Sequence
 from pathlib import Path
 from typing import TextIO
@@ -30,6 +31,7 @@ from summarizer_ml.training_data import (
     build_prompt,
     build_sft_example,
     construct_sft_dataset,
+    create_phase3_handoff,
 )
 
 
@@ -323,3 +325,14 @@ def test_construct_sft_dataset_balances_train_and_preserves_evaluation(
         config,
     )
     assert repeated == result
+
+    archive_path = tmp_path / "phase3-for-phase4.tar.gz"
+    handoff = create_phase3_handoff(final_directory, archive_path)
+    assert handoff.manifest.training_ready_records == 5
+    assert handoff.manifest.routed_source_records == 1
+    assert handoff.archive_bytes > 0
+    assert len(handoff.archive_sha256) == 64
+    with tarfile.open(archive_path, mode="r:gz") as archive:
+        names = set(archive.getnames())
+    assert "phase3-handoff/training-ready/phase3-manifest.json" in names
+    assert "phase3-handoff/processed/govreport/train.jsonl" in names

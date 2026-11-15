@@ -5,6 +5,11 @@ from summarizer_ml.training_data.builder import (
     build_sft_example,
     construct_sft_dataset,
 )
+from summarizer_ml.training_data.handoff import (
+    Phase3HandoffManifest,
+    Phase3HandoffResult,
+    create_phase3_handoff,
+)
 from summarizer_ml.training_data.models import (
     ChatMessage,
     ChatRole,
@@ -28,6 +33,8 @@ __all__ = [
     "ConstructionExclusion",
     "ConstructionExclusionReason",
     "LengthStatistics",
+    "Phase3HandoffManifest",
+    "Phase3HandoffResult",
     "Phase4Config",
     "Phase4IntegrityGates",
     "Phase4Manifest",
@@ -37,4 +44,5 @@ __all__ = [
     "build_prompt",
     "build_sft_example",
     "construct_sft_dataset",
+    "create_phase3_handoff",
 ]
