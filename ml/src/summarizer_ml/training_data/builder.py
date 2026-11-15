@@ -5,8 +5,9 @@ import heapq
 import json
 import sqlite3
 from collections import Counter, defaultdict
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from math import ceil
+from numbers import Integral
 from pathlib import Path
 from typing import Protocol, TextIO
 
@@ -52,7 +53,7 @@ class ChatTokenizer(Protocol):
         *,
         tokenize: bool,
         add_generation_prompt: bool,
-    ) -> Sequence[int]: ...
+    ) -> object: ...
 
 
 def _sha256(path: Path) -> str:
@@ -206,18 +207,29 @@ def _chat_token_ids(
     *,
     add_generation_prompt: bool,
 ) -> tuple[int, ...]:
-    raw_ids = tokenizer.apply_chat_template(
+    raw_ids: object = tokenizer.apply_chat_template(
         _message_dicts(messages),
         tokenize=True,
         add_generation_prompt=add_generation_prompt,
     )
+    if isinstance(raw_ids, Mapping):
+        raw_ids = raw_ids.get("input_ids")
+    tolist = getattr(raw_ids, "tolist", None)
+    if callable(tolist):
+        raw_ids = tolist()
     if isinstance(raw_ids, (str, bytes)) or not isinstance(raw_ids, Sequence):
         raise ValueError("Tokenizer returned invalid chat-template token IDs.")
+    if (
+        len(raw_ids) == 1
+        and isinstance(raw_ids[0], Sequence)
+        and not isinstance(raw_ids[0], (str, bytes))
+    ):
+        raw_ids = raw_ids[0]
     token_ids: list[int] = []
     for value in raw_ids:
-        if not isinstance(value, int) or isinstance(value, bool):
+        if not isinstance(value, Integral) or isinstance(value, bool):
             raise ValueError("Tokenizer returned a non-integer chat-template token ID.")
-        token_ids.append(value)
+        token_ids.append(int(value))
     return tuple(token_ids)
 
 

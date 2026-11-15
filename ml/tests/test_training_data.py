@@ -77,6 +77,80 @@ class WordChatTokenizer:
         return self.encode("\n".join(parts))
 
 
+class TensorLikeIds:
+    """Small test double for tensor and NumPy chat-template outputs."""
+
+    def __init__(self, values: list[int]) -> None:
+        self.values = values
+
+    def tolist(self) -> list[list[int]]:
+        return [self.values]
+
+
+class TensorChatTokenizer:
+    """Tokenizer returning a tensor-like singleton batch."""
+
+    def __init__(self) -> None:
+        self.base = WordChatTokenizer()
+
+    def encode(self, text: str, *, add_special_tokens: bool = False) -> list[int]:
+        return self.base.encode(text, add_special_tokens=add_special_tokens)
+
+    def decode(
+        self,
+        token_ids: Sequence[int],
+        *,
+        skip_special_tokens: bool = True,
+    ) -> str:
+        return self.base.decode(token_ids, skip_special_tokens=skip_special_tokens)
+
+    def apply_chat_template(
+        self,
+        conversation: list[dict[str, str]],
+        *,
+        tokenize: bool,
+        add_generation_prompt: bool,
+    ) -> TensorLikeIds:
+        values = self.base.apply_chat_template(
+            conversation,
+            tokenize=tokenize,
+            add_generation_prompt=add_generation_prompt,
+        )
+        return TensorLikeIds(values)
+
+
+class MappingChatTokenizer:
+    """Tokenizer returning a BatchEncoding-style mapping."""
+
+    def __init__(self) -> None:
+        self.base = WordChatTokenizer()
+
+    def encode(self, text: str, *, add_special_tokens: bool = False) -> list[int]:
+        return self.base.encode(text, add_special_tokens=add_special_tokens)
+
+    def decode(
+        self,
+        token_ids: Sequence[int],
+        *,
+        skip_special_tokens: bool = True,
+    ) -> str:
+        return self.base.decode(token_ids, skip_special_tokens=skip_special_tokens)
+
+    def apply_chat_template(
+        self,
+        conversation: list[dict[str, str]],
+        *,
+        tokenize: bool,
+        add_generation_prompt: bool,
+    ) -> dict[str, TensorLikeIds]:
+        values = self.base.apply_chat_template(
+            conversation,
+            tokenize=tokenize,
+            add_generation_prompt=add_generation_prompt,
+        )
+        return {"input_ids": TensorLikeIds(values)}
+
+
 def _processed(
     source_id: str,
     *,
@@ -208,6 +282,23 @@ def test_sft_example_compacts_source_without_truncating_completion() -> None:
     assert outcome.total_tokens <= 512
     assert outcome.completion[0].content == record.summary_text
     assert "Document window" in outcome.prompt[1].content
+
+
+def test_sft_example_normalizes_chat_token_id_containers() -> None:
+    for tokenizer in (TensorChatTokenizer(), MappingChatTokenizer()):
+        outcome = build_sft_example(
+            _processed(type(tokenizer).__name__),
+            tokenizer,
+            Phase4Config(
+                max_sequence_tokens=512,
+                minimum_source_tokens=32,
+                max_train_records_per_dataset=10,
+                records_per_shard=100,
+            ),
+        )
+
+        assert not isinstance(outcome, ConstructionExclusion)
+        assert outcome.total_tokens > 0
 
 
 def test_sft_example_routes_target_that_cannot_fit() -> None:
