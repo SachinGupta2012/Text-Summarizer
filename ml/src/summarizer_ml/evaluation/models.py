@@ -17,7 +17,7 @@ class Phase5Config(BaseModel):
     eligible_splits: tuple[str, ...] = ("test", "ca_test")
     sampling_seed: str = "qwen3-summarization-baseline-v1"
     inference_batch_size: int = Field(default=4, ge=1, le=16)
-    max_new_tokens: int = Field(default=768, ge=64, le=2_048)
+    max_new_tokens: int = Field(default=1_024, ge=64, le=2_048)
     do_sample: bool = False
     load_in_4bit: bool = True
     quantization_type: str = "nf4"
@@ -90,6 +90,7 @@ class BaselinePrediction(BaseModel):
     prediction: str
     generated_tokens: int = Field(ge=0)
     latency_seconds: float = Field(ge=0)
+    generation_max_new_tokens: int | None = Field(default=None, ge=64)
 
 
 class MetricSummary(BaseModel):
@@ -106,6 +107,7 @@ class MetricSummary(BaseModel):
     mean_reference_tokens: float = Field(ge=0)
     mean_latency_seconds: float = Field(ge=0)
     empty_predictions: int = Field(ge=0)
+    max_token_predictions: int = Field(default=0, ge=0)
 
 
 class Phase5IntegrityGates(BaseModel):

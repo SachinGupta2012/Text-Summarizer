@@ -69,6 +69,7 @@ def _mean(values: Sequence[float | int]) -> float:
 def _summarize(
     pairs: Sequence[tuple[BenchmarkExample, BaselinePrediction]],
     bertscore: Mapping[str, float] | None,
+    max_new_tokens: int,
 ) -> MetricSummary:
     rouge1: list[float] = []
     rouge2: list[float] = []
@@ -78,6 +79,7 @@ def _summarize(
     reference_tokens: list[int] = []
     latencies: list[float] = []
     empty = 0
+    max_token_predictions = 0
     for example, prediction in pairs:
         predicted = _tokens(prediction.prediction)
         reference = _tokens(example.reference_summary)
@@ -90,6 +92,7 @@ def _summarize(
         reference_tokens.append(example.reference_tokens)
         latencies.append(prediction.latency_seconds)
         empty += int(not prediction.prediction.strip())
+        max_token_predictions += int(prediction.generated_tokens >= max_new_tokens)
     return MetricSummary(
         records=len(pairs),
         rouge1_f1=_mean(rouge1),
@@ -100,6 +103,7 @@ def _summarize(
         mean_reference_tokens=_mean(reference_tokens),
         mean_latency_seconds=_mean(latencies),
         empty_predictions=empty,
+        max_token_predictions=max_token_predictions,
     )
 
 
@@ -143,7 +147,7 @@ def evaluate_baseline(
         groups["dataset"][example.dataset].append(pair)
         groups["domain"][example.domain].append(pair)
         groups["split"][example.split].append(pair)
-    overall = _summarize(pairs, bertscore)
+    overall = _summarize(pairs, bertscore, config.max_new_tokens)
     integrity = Phase5IntegrityGates(
         selection_uses_only_held_out_splits=held_out_only,
         prediction_coverage_complete=coverage_complete,
@@ -165,13 +169,16 @@ def evaluate_baseline(
         selected_records=len(selection),
         overall=overall,
         by_dataset={
-            key: _summarize(value, bertscore) for key, value in sorted(groups["dataset"].items())
+            key: _summarize(value, bertscore, config.max_new_tokens)
+            for key, value in sorted(groups["dataset"].items())
         },
         by_domain={
-            key: _summarize(value, bertscore) for key, value in sorted(groups["domain"].items())
+            key: _summarize(value, bertscore, config.max_new_tokens)
+            for key, value in sorted(groups["domain"].items())
         },
         by_split={
-            key: _summarize(value, bertscore) for key, value in sorted(groups["split"].items())
+            key: _summarize(value, bertscore, config.max_new_tokens)
+            for key, value in sorted(groups["split"].items())
         },
         integrity=integrity,
         selection_path=output_directory / "benchmark-selection.jsonl",

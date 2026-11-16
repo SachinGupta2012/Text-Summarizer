@@ -14,6 +14,7 @@ from summarizer_ml.evaluation import (
     generate_baseline_predictions,
     load_benchmark_selection,
     prepare_benchmark_selection,
+    regenerate_capped_predictions,
 )
 from summarizer_ml.training_data import (
     ChatMessage,
@@ -188,6 +189,44 @@ def test_phase5_selection_generation_resume_and_metrics(tmp_path: Path) -> None:
     assert len(predictions) == 20
     assert progress[0] == ("generation_resume", 4, 20)
     assert progress[-1] == ("generation", 20, 20)
+
+    checkpoint_rows = [
+        json.loads(line)
+        for line in predictions_path.read_text(encoding="utf-8").splitlines()
+    ]
+    for row in checkpoint_rows[:2]:
+        row["prediction"] = "truncated legacy prediction"
+        row["generated_tokens"] = 768
+        row["generation_max_new_tokens"] = None
+    predictions_path.write_text(
+        "".join(json.dumps(row, sort_keys=True) + "\n" for row in checkpoint_rows),
+        encoding="utf-8",
+    )
+
+    repair_generator = FakeGenerator()
+    predictions, repaired_ids = regenerate_capped_predictions(
+        selection,
+        predictions_path,
+        repair_generator,
+        config,
+        previous_max_new_tokens=768,
+    )
+    assert len(repaired_ids) == 2
+    assert repair_generator.calls == 1
+    assert all(
+        prediction.generation_max_new_tokens == config.max_new_tokens
+        for prediction in predictions
+        if prediction.record_id in repaired_ids
+    )
+    predictions, repeated_repairs = regenerate_capped_predictions(
+        selection,
+        predictions_path,
+        repair_generator,
+        config,
+        previous_max_new_tokens=768,
+    )
+    assert repeated_repairs == ()
+    assert repair_generator.calls == 1
 
     result = evaluate_baseline(
         selection,

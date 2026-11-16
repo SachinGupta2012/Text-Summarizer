@@ -5,6 +5,7 @@ from summarizer_ml.evaluation.benchmark import (
     generate_baseline_predictions,
     load_benchmark_selection,
     prepare_benchmark_selection,
+    regenerate_capped_predictions,
 )
 from summarizer_ml.evaluation.metrics import evaluate_baseline
 from summarizer_ml.evaluation.models import (
@@ -34,4 +35,5 @@ __all__ = [
     "generate_baseline_predictions",
     "load_benchmark_selection",
     "prepare_benchmark_selection",
+    "regenerate_capped_predictions",
 ]

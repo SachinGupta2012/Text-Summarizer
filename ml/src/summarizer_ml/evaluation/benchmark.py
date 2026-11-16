@@ -42,6 +42,22 @@ def _config_sha256(config: Phase5Config) -> str:
     return hashlib.sha256(payload.encode()).hexdigest()
 
 
+def _selection_config_sha256(config: Phase5Config) -> str:
+    """Hash only settings that can change the frozen benchmark selection."""
+
+    payload = json.dumps(
+        {
+            "benchmark_records_per_dataset": config.benchmark_records_per_dataset,
+            "eligible_splits": config.eligible_splits,
+            "model_id": config.model_id,
+            "sampling_seed": config.sampling_seed,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
 def _sampling_rank(seed: str, record_id: str) -> int:
     digest = hashlib.sha256(f"{seed}:{record_id}".encode()).digest()
     return int.from_bytes(digest, byteorder="big", signed=False)
@@ -89,7 +105,7 @@ def prepare_benchmark_selection(
     """Freeze a balanced test-only sample without reading training references."""
 
     active_config = config or Phase5Config()
-    config_hash = _config_sha256(active_config)
+    config_hash = _selection_config_sha256(active_config)
     phase4_manifest_path = phase4_directory / "phase4-manifest.json"
     if not phase4_manifest_path.is_file():
         raise FileNotFoundError("Phase 4 manifest is missing.")
@@ -105,7 +121,9 @@ def prepare_benchmark_selection(
         manifest = BenchmarkSelectionManifest.model_validate_json(
             manifest_path.read_text(encoding="utf-8")
         )
-        if manifest.config_sha256 != config_hash:
+        legacy_config = active_config.model_copy(update={"max_new_tokens": 768})
+        accepted_config_hashes = {config_hash, _config_sha256(legacy_config)}
+        if manifest.config_sha256 not in accepted_config_hashes:
             raise ValueError("Existing benchmark selection used a different configuration.")
         if manifest.phase4_manifest_sha256 != phase4_hash:
             raise ValueError("Existing benchmark selection used different Phase 4 inputs.")
@@ -254,6 +272,7 @@ def generate_baseline_predictions(
                     prediction=result.text.strip(),
                     generated_tokens=result.generated_tokens,
                     latency_seconds=result.latency_seconds,
+                    generation_max_new_tokens=config.max_new_tokens,
                 )
                 output.write(
                     json.dumps(
@@ -273,6 +292,93 @@ def generate_baseline_predictions(
     if set(existing) != set(selected_by_id):
         raise RuntimeError("Baseline prediction coverage is incomplete.")
     return tuple(existing[example.record_id] for example in selection)
+
+
+def regenerate_capped_predictions(
+    selection: Sequence[BenchmarkExample],
+    predictions_path: Path,
+    generator: SummaryGenerator,
+    config: Phase5Config,
+    *,
+    previous_max_new_tokens: int = 768,
+    progress_every: int = 5,
+    progress_callback: ProgressCallback | None = None,
+) -> tuple[tuple[BaselinePrediction, ...], tuple[str, ...]]:
+    """Regenerate only predictions that exhausted an older generation limit."""
+
+    if progress_every < 1:
+        raise ValueError("progress_every must be positive.")
+    if previous_max_new_tokens >= config.max_new_tokens:
+        raise ValueError("The previous generation limit must be lower than the active limit.")
+    selected_by_id = {example.record_id: example for example in selection}
+    if len(selected_by_id) != len(selection):
+        raise ValueError("Benchmark selection contains duplicate record IDs.")
+    existing = _load_predictions(predictions_path)
+    if set(existing) != set(selected_by_id):
+        raise RuntimeError("Capped repair requires complete baseline prediction coverage.")
+    identity_matches = all(
+        prediction.example_id == selected_by_id[record_id].example_id
+        and prediction.dataset == selected_by_id[record_id].dataset
+        and prediction.domain == selected_by_id[record_id].domain
+        and prediction.split == selected_by_id[record_id].split
+        for record_id, prediction in existing.items()
+    )
+    if not identity_matches:
+        raise RuntimeError("Prediction identities do not match the benchmark selection.")
+
+    capped: list[BenchmarkExample] = []
+    for example in selection:
+        prediction = existing[example.record_id]
+        generation_limit = prediction.generation_max_new_tokens or previous_max_new_tokens
+        if (
+            generation_limit < config.max_new_tokens
+            and prediction.generated_tokens >= generation_limit
+        ):
+            capped.append(example)
+    if not capped:
+        return tuple(existing[example.record_id] for example in selection), ()
+
+    repaired_ids: list[str] = []
+    total = len(capped)
+    for start in range(0, total, config.inference_batch_size):
+        batch = capped[start : start + config.inference_batch_size]
+        generated = tuple(generator.generate(batch))
+        if len(generated) != len(batch):
+            raise RuntimeError("Generation backend returned the wrong batch size.")
+        for example, result in zip(batch, generated, strict=True):
+            existing[example.record_id] = BaselinePrediction(
+                example_id=example.example_id,
+                record_id=example.record_id,
+                dataset=example.dataset,
+                domain=example.domain,
+                split=example.split,
+                prediction=result.text.strip(),
+                generated_tokens=result.generated_tokens,
+                latency_seconds=result.latency_seconds,
+                generation_max_new_tokens=config.max_new_tokens,
+            )
+            repaired_ids.append(example.record_id)
+        if progress_callback is not None and (
+            len(repaired_ids) == total or len(repaired_ids) % progress_every < len(batch)
+        ):
+            progress_callback("capped_repair", len(repaired_ids), total)
+
+    temporary = predictions_path.with_name(f"{predictions_path.name}.tmp")
+    with temporary.open("w", encoding="utf-8", newline="\n") as output:
+        for example in selection:
+            output.write(
+                json.dumps(
+                    existing[example.record_id].model_dump(mode="json"),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            )
+            output.write("\n")
+    temporary.replace(predictions_path)
+    return (
+        tuple(existing[example.record_id] for example in selection),
+        tuple(repaired_ids),
+    )
 
 
 def prediction_map(
