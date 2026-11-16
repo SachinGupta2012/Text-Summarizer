@@ -3,6 +3,7 @@
 import hashlib
 import heapq
 import json
+import shutil
 import sqlite3
 from collections import Counter, defaultdict
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -11,12 +12,15 @@ from numbers import Integral
 from pathlib import Path
 from typing import Protocol, TextIO
 
+from pydantic import BaseModel, ConfigDict, Field
+
 from summarizer_ml.preprocessing.models import ProcessedRecord, Split
 from summarizer_ml.preprocessing.policy import (
     ArtifactDigest,
     Phase3Manifest,
     PolicyDecision,
 )
+from summarizer_ml.preprocessing.tokenization import TokenLengthRecord
 from summarizer_ml.training_data.models import (
     ChatMessage,
     ChatRole,
@@ -35,6 +39,51 @@ from summarizer_ml.training_data.prompts import build_prompt
 ProgressCallback = Callable[[str, int], None]
 
 
+class _SelectionCheckpoint(BaseModel):
+    """Deterministic selection result reused when Phase 4 resumes."""
+
+    model_config = ConfigDict(frozen=True)
+
+    schema_version: str = "1.0"
+    config_sha256: str
+    phase3_manifest_sha256: str
+    selected_record_ids: tuple[str, ...]
+    candidate_records: int
+    candidates_by_dataset: dict[str, int]
+    candidates_by_split: dict[str, int]
+    train_candidates_by_dataset: dict[str, int]
+    selected_train_by_dataset: dict[str, int]
+    selected_by_dataset: dict[str, int]
+    selected_by_split: dict[str, int]
+
+
+class _BuildCheckpoint(BaseModel):
+    """Atomic progress marker for resumable SFT example construction."""
+
+    model_config = ConfigDict(frozen=True)
+
+    schema_version: str = "1.0"
+    config_sha256: str
+    phase3_manifest_sha256: str
+    selected_records: int
+    completed_records: int = Field(default=0, ge=0)
+    part_counts: tuple[int, ...] = ()
+
+
+class _PartRecord(BaseModel):
+    """One resumable result stored before final shards are assembled."""
+
+    model_config = ConfigDict(frozen=True)
+
+    source_sha256: str
+    example: SftExample | None = None
+    exclusion: ConstructionExclusion | None = None
+
+    def model_post_init(self, __context: object) -> None:
+        if (self.example is None) == (self.exclusion is None):
+            raise ValueError("A Phase 4 part must contain exactly one result.")
+
+
 class ChatTokenizer(Protocol):
     """Tokenizer surface required by the Phase 4 builder."""
 
@@ -46,6 +95,15 @@ class ChatTokenizer(Protocol):
         *,
         skip_special_tokens: bool = True,
     ) -> str: ...
+
+    def __call__(
+        self,
+        text: list[str],
+        *,
+        add_special_tokens: bool = False,
+        padding: bool = False,
+        truncation: bool = False,
+    ) -> Mapping[str, object]: ...
 
     def apply_chat_template(
         self,
@@ -130,26 +188,39 @@ def _sampling_rank(seed: str, record_id: str) -> int:
     return int.from_bytes(value, byteorder="big", signed=False)
 
 
-def _select_training_records(
+def _config_sha256(config: Phase4Config) -> str:
+    payload = json.dumps(config.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def _atomic_write(path: Path, content: str) -> None:
+    temporary = path.with_name(f"{path.name}.tmp")
+    temporary.write_text(content, encoding="utf-8")
+    temporary.replace(path)
+
+
+def _write_model(path: Path, model: BaseModel) -> None:
+    _atomic_write(
+        path,
+        json.dumps(model.model_dump(mode="json"), indent=2, sort_keys=True) + "\n",
+    )
+
+
+def _select_records(
     training_ready_directory: Path,
     routed_record_ids: set[str],
     config: Phase4Config,
+    config_hash: str,
+    phase3_hash: str,
     progress_every: int,
     progress_callback: ProgressCallback | None,
-) -> tuple[
-    set[str],
-    int,
-    Counter[str],
-    Counter[str],
-    Counter[str],
-    Counter[str],
-]:
+) -> _SelectionCheckpoint:
     heaps: dict[str, list[tuple[int, str]]] = defaultdict(list)
+    bucket_metadata: dict[str, tuple[str, str]] = {}
     seen_ids: set[str] = set()
     candidates_by_dataset: Counter[str] = Counter()
     candidates_by_split: Counter[str] = Counter()
     train_candidates_by_dataset: Counter[str] = Counter()
-    non_train_selected_by_dataset: Counter[str] = Counter()
     candidate_count = 0
     for record in _iter_candidates(training_ready_directory, routed_record_ids):
         candidate_count += 1
@@ -162,15 +233,19 @@ def _select_training_records(
         candidates_by_split[split] += 1
         if record.split is Split.TRAIN:
             train_candidates_by_dataset[dataset] += 1
-            rank = _sampling_rank(config.sampling_seed, record.record_id)
-            candidate = (-rank, record.record_id)
-            heap = heaps[dataset]
-            if len(heap) < config.max_train_records_per_dataset:
-                heapq.heappush(heap, candidate)
-            elif candidate > heap[0]:
-                heapq.heapreplace(heap, candidate)
+            bucket = f"train:{dataset}"
+            capacity = config.max_train_records_per_dataset
         else:
-            non_train_selected_by_dataset[dataset] += 1
+            bucket = f"evaluation:{dataset}:{split}"
+            capacity = config.max_evaluation_records_per_dataset_split
+        bucket_metadata[bucket] = (dataset, split)
+        rank = _sampling_rank(config.sampling_seed, record.record_id)
+        candidate = (-rank, record.record_id)
+        heap = heaps[bucket]
+        if len(heap) < capacity:
+            heapq.heappush(heap, candidate)
+        elif candidate > heap[0]:
+            heapq.heapreplace(heap, candidate)
         _report_progress(
             progress_callback,
             "candidate_scan",
@@ -185,15 +260,29 @@ def _select_training_records(
             progress_every,
             final=True,
         )
-    selected_train_ids = {record_id for heap in heaps.values() for _, record_id in heap}
-    selected_train_by_dataset = Counter(dataset for dataset, heap in heaps.items() for _ in heap)
-    return (
-        selected_train_ids,
-        candidate_count,
-        candidates_by_dataset,
-        candidates_by_split,
-        train_candidates_by_dataset,
-        selected_train_by_dataset + non_train_selected_by_dataset,
+    selected_record_ids = tuple(
+        sorted(record_id for heap in heaps.values() for _, record_id in heap)
+    )
+    selected_by_dataset: Counter[str] = Counter()
+    selected_by_split: Counter[str] = Counter()
+    selected_train_by_dataset: Counter[str] = Counter()
+    for bucket, heap in heaps.items():
+        dataset, split = bucket_metadata[bucket]
+        selected_by_dataset[dataset] += len(heap)
+        selected_by_split[split] += len(heap)
+        if split == Split.TRAIN.value:
+            selected_train_by_dataset[dataset] += len(heap)
+    return _SelectionCheckpoint(
+        config_sha256=config_hash,
+        phase3_manifest_sha256=phase3_hash,
+        selected_record_ids=selected_record_ids,
+        candidate_records=candidate_count,
+        candidates_by_dataset=dict(sorted(candidates_by_dataset.items())),
+        candidates_by_split=dict(sorted(candidates_by_split.items())),
+        train_candidates_by_dataset=dict(sorted(train_candidates_by_dataset.items())),
+        selected_train_by_dataset=dict(sorted(selected_train_by_dataset.items())),
+        selected_by_dataset=dict(sorted(selected_by_dataset.items())),
+        selected_by_split=dict(sorted(selected_by_split.items())),
     )
 
 
@@ -201,36 +290,60 @@ def _message_dicts(messages: tuple[ChatMessage, ...]) -> list[dict[str, str]]:
     return [{"role": message.role.value, "content": message.content} for message in messages]
 
 
-def _chat_token_ids(
-    tokenizer: ChatTokenizer,
-    messages: tuple[ChatMessage, ...],
-    *,
-    add_generation_prompt: bool,
-) -> tuple[int, ...]:
-    raw_ids: object = tokenizer.apply_chat_template(
-        _message_dicts(messages),
-        tokenize=True,
-        add_generation_prompt=add_generation_prompt,
-    )
+def _token_rows(raw_ids: object, expected_rows: int) -> tuple[tuple[int, ...], ...]:
     if isinstance(raw_ids, Mapping):
         raw_ids = raw_ids.get("input_ids")
     tolist = getattr(raw_ids, "tolist", None)
     if callable(tolist):
         raw_ids = tolist()
     if isinstance(raw_ids, (str, bytes)) or not isinstance(raw_ids, Sequence):
-        raise ValueError("Tokenizer returned invalid chat-template token IDs.")
-    if (
-        len(raw_ids) == 1
-        and isinstance(raw_ids[0], Sequence)
-        and not isinstance(raw_ids[0], (str, bytes))
-    ):
-        raw_ids = raw_ids[0]
-    token_ids: list[int] = []
-    for value in raw_ids:
-        if not isinstance(value, Integral) or isinstance(value, bool):
-            raise ValueError("Tokenizer returned a non-integer chat-template token ID.")
-        token_ids.append(int(value))
-    return tuple(token_ids)
+        raise ValueError("Tokenizer returned invalid token IDs.")
+    if expected_rows == 1 and (not raw_ids or isinstance(raw_ids[0], Integral)):
+        raw_ids = [raw_ids]
+    if len(raw_ids) != expected_rows:
+        raise ValueError("Tokenizer returned an unexpected number of token rows.")
+    rows: list[tuple[int, ...]] = []
+    for raw_row in raw_ids:
+        if isinstance(raw_row, (str, bytes)) or not isinstance(raw_row, Sequence):
+            raise ValueError("Tokenizer returned an invalid token row.")
+        row: list[int] = []
+        for value in raw_row:
+            if not isinstance(value, Integral) or isinstance(value, bool):
+                raise ValueError("Tokenizer returned a non-integer token ID.")
+            row.append(int(value))
+        rows.append(tuple(row))
+    return tuple(rows)
+
+
+def _batch_token_ids(
+    tokenizer: ChatTokenizer,
+    texts: list[str],
+) -> tuple[tuple[int, ...], ...]:
+    if not texts:
+        return ()
+    encoded = tokenizer(
+        texts,
+        add_special_tokens=False,
+        padding=False,
+        truncation=False,
+    )
+    return _token_rows(encoded, len(texts))
+
+
+def _chat_text(
+    tokenizer: ChatTokenizer,
+    messages: tuple[ChatMessage, ...],
+    *,
+    add_generation_prompt: bool,
+) -> str:
+    rendered = tokenizer.apply_chat_template(
+        _message_dicts(messages),
+        tokenize=False,
+        add_generation_prompt=add_generation_prompt,
+    )
+    if not isinstance(rendered, str) or not rendered:
+        raise ValueError("Tokenizer returned invalid rendered chat text.")
+    return rendered
 
 
 def _uniform_windows(
@@ -261,27 +374,57 @@ def _uniform_windows(
     return "\n\n".join(sections)
 
 
+def _render_batch(
+    records: Sequence[ProcessedRecord],
+    source_texts: Sequence[str],
+    tokenizer: ChatTokenizer,
+) -> tuple[tuple[tuple[ChatMessage, ...], tuple[ChatMessage, ...], int, int, int], ...]:
+    if len(records) != len(source_texts):
+        raise ValueError("Records and source texts must have identical lengths.")
+    prompts = tuple(
+        build_prompt(record, source_text)
+        for record, source_text in zip(records, source_texts, strict=True)
+    )
+    completions = tuple(
+        (ChatMessage(role=ChatRole.ASSISTANT, content=record.summary_text),) for record in records
+    )
+    prompt_texts = [_chat_text(tokenizer, prompt, add_generation_prompt=True) for prompt in prompts]
+    full_texts = [
+        _chat_text(
+            tokenizer,
+            (*prompt, *completion),
+            add_generation_prompt=False,
+        )
+        for prompt, completion in zip(prompts, completions, strict=True)
+    ]
+    token_rows = _batch_token_ids(tokenizer, [*prompt_texts, *full_texts])
+    prompt_rows = token_rows[: len(records)]
+    full_rows = token_rows[len(records) :]
+    rendered: list[tuple[tuple[ChatMessage, ...], tuple[ChatMessage, ...], int, int, int]] = []
+    for prompt, completion, prompt_ids, full_ids in zip(
+        prompts,
+        completions,
+        prompt_rows,
+        full_rows,
+        strict=True,
+    ):
+        if full_ids[: len(prompt_ids)] != prompt_ids:
+            raise ValueError(
+                "Chat template generation prompt is not a prefix of the completed conversation."
+            )
+        completion_tokens = len(full_ids) - len(prompt_ids)
+        if completion_tokens < 1:
+            raise ValueError("Chat template produced an empty completion span.")
+        rendered.append((prompt, completion, len(prompt_ids), completion_tokens, len(full_ids)))
+    return tuple(rendered)
+
+
 def _render_lengths(
     record: ProcessedRecord,
     source_text: str,
     tokenizer: ChatTokenizer,
 ) -> tuple[tuple[ChatMessage, ...], tuple[ChatMessage, ...], int, int, int]:
-    prompt = build_prompt(record, source_text)
-    completion = (ChatMessage(role=ChatRole.ASSISTANT, content=record.summary_text),)
-    prompt_ids = _chat_token_ids(tokenizer, prompt, add_generation_prompt=True)
-    full_ids = _chat_token_ids(
-        tokenizer,
-        (*prompt, *completion),
-        add_generation_prompt=False,
-    )
-    if full_ids[: len(prompt_ids)] != prompt_ids:
-        raise ValueError(
-            "Chat template generation prompt is not a prefix of the completed conversation."
-        )
-    completion_tokens = len(full_ids) - len(prompt_ids)
-    if completion_tokens < 1:
-        raise ValueError("Chat template produced an empty completion span.")
-    return prompt, completion, len(prompt_ids), completion_tokens, len(full_ids)
+    return _render_batch((record,), (source_text,), tokenizer)[0]
 
 
 def _example_id(record: ProcessedRecord, config: Phase4Config) -> str:
@@ -289,69 +432,15 @@ def _example_id(record: ProcessedRecord, config: Phase4Config) -> str:
     return hashlib.sha256(identity.encode()).hexdigest()
 
 
-def build_sft_example(
+def _complete_example(
     record: ProcessedRecord,
-    tokenizer: ChatTokenizer,
     config: Phase4Config,
+    rendered: tuple[tuple[ChatMessage, ...], tuple[ChatMessage, ...], int, int, int],
+    original_source_tokens: int,
+    used_source_tokens: int,
+    strategy: SourceStrategy,
 ) -> SftExample | ConstructionExclusion:
-    """Fit one record without truncating its reference summary."""
-
-    source_ids = tuple(tokenizer.encode(record.source_text, add_special_tokens=False))
-    if not source_ids:
-        raise ValueError("Processed record produced an empty source token sequence.")
-    prompt, completion, prompt_tokens, completion_tokens, total_tokens = _render_lengths(
-        record,
-        record.source_text,
-        tokenizer,
-    )
-    strategy = SourceStrategy.COMPLETE
-    used_source_text = record.source_text
-
-    if total_tokens > config.max_sequence_tokens:
-        minimum_budget = min(config.minimum_source_tokens, len(source_ids))
-        minimum_text = _uniform_windows(
-            source_ids,
-            minimum_budget,
-            config.source_windows,
-            tokenizer,
-        )
-        minimum_render = _render_lengths(record, minimum_text, tokenizer)
-        if minimum_render[4] > config.max_sequence_tokens:
-            reason = ConstructionExclusionReason.INSUFFICIENT_SOURCE_BUDGET
-            if minimum_render[3] >= config.max_sequence_tokens:
-                reason = ConstructionExclusionReason.TARGET_EXCEEDS_CONTEXT
-            return ConstructionExclusion(
-                record_id=record.record_id,
-                dataset=record.dataset.value,
-                split=record.split.value,
-                reason=reason,
-                source_tokens=len(source_ids),
-                completion_tokens=minimum_render[3],
-                minimum_total_tokens=minimum_render[4],
-            )
-
-        low = minimum_budget
-        high = len(source_ids) - 1
-        best = (minimum_budget, minimum_text, minimum_render)
-        while low <= high:
-            budget = (low + high) // 2
-            candidate_text = _uniform_windows(
-                source_ids,
-                budget,
-                config.source_windows,
-                tokenizer,
-            )
-            candidate_render = _render_lengths(record, candidate_text, tokenizer)
-            if candidate_render[4] <= config.max_sequence_tokens:
-                best = (budget, candidate_text, candidate_render)
-                low = budget + 1
-            else:
-                high = budget - 1
-        _, used_source_text, rendered = best
-        prompt, completion, prompt_tokens, completion_tokens, total_tokens = rendered
-        strategy = SourceStrategy.UNIFORM_WINDOWS
-
-    used_source_tokens = len(tokenizer.encode(used_source_text, add_special_tokens=False))
+    prompt, completion, prompt_tokens, completion_tokens, total_tokens = rendered
     return SftExample(
         example_id=_example_id(record, config),
         record_id=record.record_id,
@@ -364,12 +453,159 @@ def build_sft_example(
         source_strategy=strategy,
         prompt=prompt,
         completion=completion,
-        original_source_tokens=len(source_ids),
+        original_source_tokens=original_source_tokens,
         used_source_tokens=used_source_tokens,
         prompt_tokens=prompt_tokens,
         completion_tokens=completion_tokens,
         total_tokens=total_tokens,
     )
+
+
+def _fit_long_source(
+    record: ProcessedRecord,
+    tokenizer: ChatTokenizer,
+    config: Phase4Config,
+    source_ids: tuple[int, ...],
+    initial_render: tuple[tuple[ChatMessage, ...], tuple[ChatMessage, ...], int, int, int],
+) -> SftExample | ConstructionExclusion:
+    minimum_budget = min(config.minimum_source_tokens, len(source_ids))
+    prompt_overhead = max(0, initial_render[2] - len(source_ids))
+    available = (
+        config.max_sequence_tokens
+        - initial_render[3]
+        - prompt_overhead
+        - config.source_budget_reserve_tokens
+    )
+    budget = min(len(source_ids) - 1, max(minimum_budget, available))
+    rendered = initial_render
+    used_source_text = record.source_text
+
+    for _ in range(config.source_fit_attempts):
+        used_source_text = _uniform_windows(
+            source_ids,
+            budget,
+            config.source_windows,
+            tokenizer,
+        )
+        rendered = _render_lengths(record, used_source_text, tokenizer)
+        if rendered[4] <= config.max_sequence_tokens:
+            return _complete_example(
+                record,
+                config,
+                rendered,
+                len(source_ids),
+                budget,
+                SourceStrategy.UNIFORM_WINDOWS,
+            )
+        overflow = rendered[4] - config.max_sequence_tokens
+        reduced = max(
+            minimum_budget,
+            budget - overflow - config.source_budget_reserve_tokens,
+        )
+        if reduced == budget:
+            break
+        budget = reduced
+
+    if budget != minimum_budget:
+        budget = minimum_budget
+        used_source_text = _uniform_windows(
+            source_ids,
+            budget,
+            config.source_windows,
+            tokenizer,
+        )
+        rendered = _render_lengths(record, used_source_text, tokenizer)
+        if rendered[4] <= config.max_sequence_tokens:
+            return _complete_example(
+                record,
+                config,
+                rendered,
+                len(source_ids),
+                budget,
+                SourceStrategy.UNIFORM_WINDOWS,
+            )
+
+    reason = ConstructionExclusionReason.INSUFFICIENT_SOURCE_BUDGET
+    if rendered[3] >= config.max_sequence_tokens:
+        reason = ConstructionExclusionReason.TARGET_EXCEEDS_CONTEXT
+    return ConstructionExclusion(
+        record_id=record.record_id,
+        dataset=record.dataset.value,
+        split=record.split.value,
+        reason=reason,
+        source_tokens=len(source_ids),
+        completion_tokens=rendered[3],
+        minimum_total_tokens=rendered[4],
+    )
+
+
+def build_sft_examples(
+    records: Sequence[ProcessedRecord],
+    tokenizer: ChatTokenizer,
+    config: Phase4Config,
+    source_token_lengths: Mapping[str, int] | None = None,
+) -> tuple[SftExample | ConstructionExclusion, ...]:
+    """Build a tokenizer batch while retaining exact per-example length checks."""
+
+    if not records:
+        return ()
+    rendered = _render_batch(
+        records,
+        tuple(record.source_text for record in records),
+        tokenizer,
+    )
+    known_lengths = source_token_lengths or {}
+    required_source_indexes = [
+        index
+        for index, (record, initial) in enumerate(zip(records, rendered, strict=True))
+        if record.record_id not in known_lengths or initial[4] > config.max_sequence_tokens
+    ]
+    source_rows: dict[int, tuple[int, ...]] = {}
+    if required_source_indexes:
+        encoded_rows = _batch_token_ids(
+            tokenizer,
+            [records[index].source_text for index in required_source_indexes],
+        )
+        source_rows = dict(zip(required_source_indexes, encoded_rows, strict=True))
+
+    outcomes: list[SftExample | ConstructionExclusion] = []
+    for index, (record, initial) in enumerate(zip(records, rendered, strict=True)):
+        source_ids = source_rows.get(index)
+        original_source_tokens = known_lengths.get(record.record_id)
+        if source_ids is not None:
+            if not source_ids:
+                raise ValueError("Processed record produced an empty source token sequence.")
+            if original_source_tokens is not None and original_source_tokens != len(source_ids):
+                raise ValueError("Phase 3 and Phase 4 source token lengths do not match.")
+            original_source_tokens = len(source_ids)
+        if original_source_tokens is None:
+            raise RuntimeError("Source token length was not measured.")
+        if initial[4] <= config.max_sequence_tokens:
+            outcomes.append(
+                _complete_example(
+                    record,
+                    config,
+                    initial,
+                    original_source_tokens,
+                    original_source_tokens,
+                    SourceStrategy.COMPLETE,
+                )
+            )
+            continue
+        if source_ids is None:
+            raise RuntimeError("Long source token IDs were not materialized.")
+        outcomes.append(_fit_long_source(record, tokenizer, config, source_ids, initial))
+    return tuple(outcomes)
+
+
+def build_sft_example(
+    record: ProcessedRecord,
+    tokenizer: ChatTokenizer,
+    config: Phase4Config,
+) -> SftExample | ConstructionExclusion:
+    """Fit one record without truncating its reference summary."""
+
+    return build_sft_examples((record,), tokenizer, config)[0]
 
 
 class _ShardWriter:
@@ -510,91 +746,220 @@ def _output_digests(staging: Path) -> tuple[ArtifactDigest, ...]:
     return tuple(_artifact_digest(path, staging) for path in paths)
 
 
-def construct_sft_dataset(
+def _load_source_token_lengths(
     training_ready_directory: Path,
-    output_directory: Path,
-    tokenizer: ChatTokenizer,
-    config: Phase4Config | None = None,
-    *,
-    progress_every: int = 25_000,
-    progress_callback: ProgressCallback | None = None,
-) -> Phase4Result:
-    """Construct balanced prompt-completion shards and validate every example."""
+    selected_record_ids: set[str],
+) -> dict[str, int]:
+    path = training_ready_directory / "analysis" / "token-lengths.jsonl"
+    if not path.is_file():
+        return {}
+    lengths: dict[str, int] = {}
+    with path.open(encoding="utf-8") as source_file:
+        for line_number, line in enumerate(source_file, start=1):
+            if not line.strip():
+                continue
+            try:
+                measurement = TokenLengthRecord.model_validate_json(line)
+            except ValueError as error:
+                raise ValueError(f"Invalid Phase 3 token length at {path}:{line_number}") from error
+            if measurement.record_id not in selected_record_ids:
+                continue
+            if measurement.record_id in lengths:
+                raise ValueError("Phase 3 token lengths contain duplicate record IDs.")
+            lengths[measurement.record_id] = measurement.source_tokens
+    return lengths
 
-    if progress_every < 1:
-        raise ValueError("progress_every must be positive.")
-    active_config = config or Phase4Config()
-    manifest_path = output_directory / "phase4-manifest.json"
-    phase3_manifest_path = training_ready_directory / "phase3-manifest.json"
-    if not phase3_manifest_path.is_file():
-        raise FileNotFoundError("Phase 3 training-ready manifest is missing.")
-    phase3_hash = _sha256(phase3_manifest_path)
-    if manifest_path.is_file():
-        manifest = Phase4Manifest.model_validate_json(manifest_path.read_text(encoding="utf-8"))
-        if manifest.config != active_config or manifest.phase3_manifest_sha256 != phase3_hash:
-            raise ValueError("Existing Phase 4 output used different inputs or configuration.")
-        return Phase4Result(output_directory=output_directory, manifest=manifest)
-    if output_directory.exists():
-        raise FileExistsError(f"Phase 4 output is incomplete or non-empty: {output_directory}")
-    staging = output_directory.with_name(f"{output_directory.name}.staging")
-    if staging.exists():
-        raise FileExistsError(f"A previous Phase 4 staging directory exists: {staging}")
 
-    phase3_manifest = Phase3Manifest.model_validate_json(
-        phase3_manifest_path.read_text(encoding="utf-8")
-    )
-    if phase3_manifest.tokenizer_id != active_config.model_id:
-        raise ValueError("Phase 3 tokenizer and Phase 4 model IDs do not match.")
-    if not _phase3_passed(phase3_manifest):
-        raise RuntimeError("Phase 3 integrity gates did not pass.")
-
-    route_root = training_ready_directory / "routing"
-    chunk_ids, chunk_route_count = _read_route_ids(route_root / "requires_chunking.jsonl")
-    if chunk_route_count != phase3_manifest.by_action.get("requires_chunking", 0):
-        raise RuntimeError("Phase 3 chunking route count does not match its manifest.")
-    (
-        selected_train_ids,
-        candidate_count,
-        candidates_by_dataset,
-        candidates_by_split,
-        train_candidates_by_dataset,
-        selected_by_dataset,
-    ) = _select_training_records(
+def _load_or_create_selection(
+    staging: Path,
+    training_ready_directory: Path,
+    routed_record_ids: set[str],
+    config: Phase4Config,
+    config_hash: str,
+    phase3_hash: str,
+    progress_every: int,
+    progress_callback: ProgressCallback | None,
+) -> _SelectionCheckpoint:
+    path = staging / "selection-checkpoint.json"
+    if path.is_file():
+        selection = _SelectionCheckpoint.model_validate_json(path.read_text(encoding="utf-8"))
+        if selection.config_sha256 != config_hash:
+            raise ValueError("Phase 4 selection checkpoint used a different configuration.")
+        if selection.phase3_manifest_sha256 != phase3_hash:
+            raise ValueError("Phase 4 selection checkpoint used different Phase 3 inputs.")
+        if progress_callback is not None:
+            progress_callback("candidate_resume", selection.candidate_records)
+        return selection
+    selection = _select_records(
         training_ready_directory,
-        chunk_ids,
-        active_config,
+        routed_record_ids,
+        config,
+        config_hash,
+        phase3_hash,
         progress_every,
         progress_callback,
     )
-    selected_train_count = len(selected_train_ids)
-    selected_count = selected_train_count + (
-        candidate_count - candidates_by_split.get(Split.TRAIN.value, 0)
-    )
-    selected_by_split: Counter[str] = Counter(
-        {split: count for split, count in candidates_by_split.items() if split != Split.TRAIN.value}
-    )
-    selected_by_split[Split.TRAIN.value] = selected_train_count
+    _write_model(path, selection)
+    return selection
 
-    staging.mkdir(parents=True)
-    exclusions_root = staging / "exclusions"
+
+def _load_or_create_build_checkpoint(
+    staging: Path,
+    selection: _SelectionCheckpoint,
+) -> _BuildCheckpoint:
+    path = staging / "build-checkpoint.json"
+    parts_root = staging / "parts"
+    parts_root.mkdir(exist_ok=True)
+    for temporary in parts_root.glob("*.tmp"):
+        temporary.unlink()
+    if path.is_file():
+        checkpoint = _BuildCheckpoint.model_validate_json(path.read_text(encoding="utf-8"))
+        if checkpoint.config_sha256 != selection.config_sha256:
+            raise ValueError("Phase 4 build checkpoint used a different configuration.")
+        if checkpoint.phase3_manifest_sha256 != selection.phase3_manifest_sha256:
+            raise ValueError("Phase 4 build checkpoint used different Phase 3 inputs.")
+        if checkpoint.selected_records != len(selection.selected_record_ids):
+            raise ValueError("Phase 4 build checkpoint selection size changed.")
+        if checkpoint.completed_records != sum(checkpoint.part_counts):
+            raise ValueError("Phase 4 build checkpoint counts are inconsistent.")
+    else:
+        checkpoint = _BuildCheckpoint(
+            config_sha256=selection.config_sha256,
+            phase3_manifest_sha256=selection.phase3_manifest_sha256,
+            selected_records=len(selection.selected_record_ids),
+        )
+        _write_model(path, checkpoint)
+
+    expected_names = {f"part-{index:06d}.jsonl" for index in range(len(checkpoint.part_counts))}
+    for part in parts_root.glob("part-*.jsonl"):
+        if part.name not in expected_names:
+            part.unlink()
+    missing = [name for name in sorted(expected_names) if not (parts_root / name).is_file()]
+    if missing:
+        raise FileNotFoundError(f"Phase 4 checkpoint is missing part files: {missing[:3]}")
+    return checkpoint
+
+
+def _write_part(
+    path: Path,
+    records: Sequence[ProcessedRecord],
+    outcomes: Sequence[SftExample | ConstructionExclusion],
+) -> None:
+    if len(records) != len(outcomes):
+        raise ValueError("Phase 4 batch records and outcomes do not match.")
+    temporary = path.with_name(f"{path.name}.tmp")
+    with temporary.open("x", encoding="utf-8", newline="\n") as output:
+        for record, outcome in zip(records, outcomes, strict=True):
+            part = _PartRecord(
+                source_sha256=record.source_sha256,
+                example=outcome if isinstance(outcome, SftExample) else None,
+                exclusion=outcome if isinstance(outcome, ConstructionExclusion) else None,
+            )
+            output.write(
+                json.dumps(part.model_dump(mode="json"), ensure_ascii=False, sort_keys=True)
+            )
+            output.write("\n")
+        output.flush()
+    temporary.replace(path)
+
+
+def _build_resumable_parts(
+    staging: Path,
+    training_ready_directory: Path,
+    routed_record_ids: set[str],
+    selection: _SelectionCheckpoint,
+    checkpoint: _BuildCheckpoint,
+    tokenizer: ChatTokenizer,
+    config: Phase4Config,
+    source_token_lengths: Mapping[str, int],
+    progress_every: int,
+    progress_callback: ProgressCallback | None,
+) -> _BuildCheckpoint:
+    selected_ids = set(selection.selected_record_ids)
+    completed = checkpoint.completed_records
+    if progress_callback is not None and completed:
+        progress_callback("example_resume", completed)
+    next_progress = ((completed // progress_every) + 1) * progress_every
+    selected_seen = 0
+    batch: list[ProcessedRecord] = []
+
+    def commit_batch(active_checkpoint: _BuildCheckpoint) -> _BuildCheckpoint:
+        nonlocal completed, next_progress
+        outcomes = build_sft_examples(batch, tokenizer, config, source_token_lengths)
+        part_index = len(active_checkpoint.part_counts)
+        part_path = staging / "parts" / f"part-{part_index:06d}.jsonl"
+        _write_part(part_path, batch, outcomes)
+        completed += len(batch)
+        updated = _BuildCheckpoint(
+            config_sha256=active_checkpoint.config_sha256,
+            phase3_manifest_sha256=active_checkpoint.phase3_manifest_sha256,
+            selected_records=active_checkpoint.selected_records,
+            completed_records=completed,
+            part_counts=(*active_checkpoint.part_counts, len(batch)),
+        )
+        _write_model(staging / "build-checkpoint.json", updated)
+        batch.clear()
+        if progress_callback is not None and completed >= next_progress:
+            progress_callback("example_build", completed)
+            while next_progress <= completed:
+                next_progress += progress_every
+        return updated
+
+    active_checkpoint = checkpoint
+    for record in _iter_candidates(training_ready_directory, routed_record_ids):
+        if record.record_id not in selected_ids:
+            continue
+        if selected_seen < checkpoint.completed_records:
+            selected_seen += 1
+            continue
+        selected_seen += 1
+        batch.append(record)
+        if len(batch) >= config.construction_batch_size:
+            active_checkpoint = commit_batch(active_checkpoint)
+    if batch:
+        active_checkpoint = commit_batch(active_checkpoint)
+    if selected_seen != len(selected_ids):
+        raise RuntimeError("Phase 4 selected record coverage is incomplete.")
+    if completed != len(selected_ids):
+        raise RuntimeError("Phase 4 resumable build did not complete every selection.")
+    if progress_callback is not None and completed % progress_every:
+        progress_callback("example_build", completed)
+    return active_checkpoint
+
+
+def _assemble_parts(
+    staging: Path,
+    output_directory: Path,
+    training_ready_directory: Path,
+    selection: _SelectionCheckpoint,
+    checkpoint: _BuildCheckpoint,
+    phase3_manifest: Phase3Manifest,
+    phase3_hash: str,
+    config: Phase4Config,
+    long_target_count: int,
+) -> Phase4Result:
+    finalizing = staging / "finalizing"
+    if finalizing.exists():
+        shutil.rmtree(finalizing)
+    finalizing.mkdir()
+    exclusions_root = finalizing / "exclusions"
     exclusions_root.mkdir()
-    long_target_count = _copy_long_target_routes(
-        route_root / "long_target.jsonl",
+    copied_long_targets = _copy_long_target_routes(
+        training_ready_directory / "routing" / "long_target.jsonl",
         exclusions_root / "long-target.jsonl",
     )
-    if long_target_count != phase3_manifest.by_action.get("long_target", 0):
-        raise RuntimeError("Phase 3 long-target route count does not match its manifest.")
-    construction_exclusions_path = exclusions_root / "construction.jsonl"
-    construction_exclusions_file = construction_exclusions_path.open(
+    if copied_long_targets != long_target_count:
+        raise RuntimeError("Phase 3 long-target route count changed during Phase 4.")
+    construction_file = (exclusions_root / "construction.jsonl").open(
         "x", encoding="utf-8", newline="\n"
     )
-    writer = _ShardWriter(staging / "shards", active_config.records_per_shard)
-    index_path = staging / "phase4-integrity.sqlite3"
+    writer = _ShardWriter(finalizing / "shards", config.records_per_shard)
+    index_path = finalizing / "phase4-integrity.sqlite3"
     connection = sqlite3.connect(index_path)
     _create_integrity_index(connection)
-    example_rows: list[tuple[str, str, str, str, str]] = []
-    generated = 0
+    rows: list[tuple[str, str, str, str, str]] = []
     selected_seen = 0
+    generated = 0
     construction_exclusions = 0
     sequence_violations = 0
     split_mismatches = 0
@@ -604,79 +969,79 @@ def construct_sft_dataset(
     source_strategies: Counter[str] = Counter()
     total_lengths: list[int] = []
     try:
-        for record in _iter_candidates(training_ready_directory, chunk_ids):
-            if record.split is Split.TRAIN and record.record_id not in selected_train_ids:
-                continue
-            selected_seen += 1
-            outcome = build_sft_example(record, tokenizer, active_config)
-            if isinstance(outcome, ConstructionExclusion):
-                construction_exclusions_file.write(
-                    json.dumps(outcome.model_dump(mode="json"), sort_keys=True)
-                )
-                construction_exclusions_file.write("\n")
-                construction_exclusions += 1
-                excluded_by_split[outcome.split] += 1
-            else:
-                if outcome.total_tokens > active_config.max_sequence_tokens:
-                    sequence_violations += 1
-                if outcome.split != record.split.value:
-                    split_mismatches += 1
-                writer.write(outcome)
-                generated += 1
-                examples_by_dataset[outcome.dataset] += 1
-                examples_by_split[outcome.split] += 1
-                source_strategies[outcome.source_strategy.value] += 1
-                total_lengths.append(outcome.total_tokens)
-                example_rows.append(
-                    (
-                        outcome.example_id,
-                        outcome.record_id,
-                        record.source_sha256,
-                        outcome.group_id,
-                        outcome.split,
+        for part_index, expected_count in enumerate(checkpoint.part_counts):
+            part_path = staging / "parts" / f"part-{part_index:06d}.jsonl"
+            part_count = 0
+            with part_path.open(encoding="utf-8") as part_file:
+                for line_number, line in enumerate(part_file, start=1):
+                    if not line.strip():
+                        continue
+                    try:
+                        part = _PartRecord.model_validate_json(line)
+                    except ValueError as error:
+                        raise ValueError(
+                            f"Invalid Phase 4 part at {part_path}:{line_number}"
+                        ) from error
+                    part_count += 1
+                    selected_seen += 1
+                    if part.exclusion is not None:
+                        construction_file.write(
+                            json.dumps(part.exclusion.model_dump(mode="json"), sort_keys=True)
+                        )
+                        construction_file.write("\n")
+                        construction_exclusions += 1
+                        excluded_by_split[part.exclusion.split] += 1
+                        continue
+                    if part.example is None:
+                        raise RuntimeError("Phase 4 part has no outcome.")
+                    example = part.example
+                    if example.total_tokens > config.max_sequence_tokens:
+                        sequence_violations += 1
+                    writer.write(example)
+                    generated += 1
+                    examples_by_dataset[example.dataset] += 1
+                    examples_by_split[example.split] += 1
+                    source_strategies[example.source_strategy.value] += 1
+                    total_lengths.append(example.total_tokens)
+                    rows.append(
+                        (
+                            example.example_id,
+                            example.record_id,
+                            part.source_sha256,
+                            example.group_id,
+                            example.split,
+                        )
                     )
-                )
-                if len(example_rows) >= 1_000:
-                    _flush_examples(connection, example_rows)
-            _report_progress(
-                progress_callback,
-                "example_build",
-                selected_seen,
-                progress_every,
-            )
-        if example_rows:
-            _flush_examples(connection, example_rows)
+                    if len(rows) >= 1_000:
+                        _flush_examples(connection, rows)
+            if part_count != expected_count:
+                raise RuntimeError(f"Phase 4 part count changed: {part_path}")
+        if rows:
+            _flush_examples(connection, rows)
         connection.commit()
         leakage_findings = _count_leakage(connection)
     finally:
         writer.close()
-        construction_exclusions_file.close()
+        construction_file.close()
         connection.close()
     index_path.unlink(missing_ok=True)
-    if selected_seen % progress_every:
-        _report_progress(
-            progress_callback,
-            "example_build",
-            selected_seen,
-            progress_every,
-            final=True,
-        )
 
-    train_caps_respected = all(
-        selected_by_dataset.get(dataset, 0)
-        - (candidates_by_dataset[dataset] - train_candidates_by_dataset.get(dataset, 0))
-        <= active_config.max_train_records_per_dataset
-        for dataset in candidates_by_dataset
-    )
+    selected_by_split = Counter(selection.selected_by_split)
     evaluation_preserved = all(
         examples_by_split.get(split, 0) + excluded_by_split.get(split, 0) == count
         for split, count in selected_by_split.items()
         if split != Split.TRAIN.value
     )
+    train_caps_respected = all(
+        count <= config.max_train_records_per_dataset
+        for count in selection.selected_train_by_dataset.values()
+    )
     integrity = Phase4IntegrityGates(
-        phase3_integrity_passed=True,
-        selection_coverage_complete=selected_seen == selected_count,
-        generated_or_excluded_complete=(generated + construction_exclusions == selected_count),
+        phase3_integrity_passed=_phase3_passed(phase3_manifest),
+        selection_coverage_complete=selected_seen == len(selection.selected_record_ids),
+        generated_or_excluded_complete=(
+            generated + construction_exclusions == len(selection.selected_record_ids)
+        ),
         evaluation_splits_preserved=evaluation_preserved,
         train_caps_respected=train_caps_respected,
         split_assignments_preserved=split_mismatches == 0,
@@ -694,28 +1059,123 @@ def construct_sft_dataset(
         raise RuntimeError(f"Phase 4 integrity gates failed: {failed_gates}")
 
     manifest = Phase4Manifest(
-        config=active_config,
+        config=config,
         phase3_manifest_sha256=phase3_hash,
-        candidate_records=candidate_count,
-        selected_records=selected_count,
+        candidate_records=selection.candidate_records,
+        selected_records=len(selection.selected_record_ids),
         generated_examples=generated,
-        sampling_dropped_records=candidate_count - selected_count,
+        sampling_dropped_records=(selection.candidate_records - len(selection.selected_record_ids)),
         phase3_long_target_exclusions=long_target_count,
         construction_exclusions=construction_exclusions,
-        candidates_by_dataset=dict(sorted(candidates_by_dataset.items())),
-        candidates_by_split=dict(sorted(candidates_by_split.items())),
-        selected_by_dataset=dict(sorted(selected_by_dataset.items())),
-        selected_by_split=dict(sorted(selected_by_split.items())),
+        candidates_by_dataset=selection.candidates_by_dataset,
+        candidates_by_split=selection.candidates_by_split,
+        selected_by_dataset=selection.selected_by_dataset,
+        selected_by_split=selection.selected_by_split,
         examples_by_dataset=dict(sorted(examples_by_dataset.items())),
         examples_by_split=dict(sorted(examples_by_split.items())),
         source_strategies=dict(sorted(source_strategies.items())),
         total_token_statistics=_length_statistics(total_lengths),
         integrity=integrity,
-        output_artifacts=_output_digests(staging),
+        output_artifacts=_output_digests(finalizing),
     )
-    (staging / "phase4-manifest.json").write_text(
+    (finalizing / "phase4-manifest.json").write_text(
         json.dumps(manifest.model_dump(mode="json"), indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
-    staging.rename(output_directory)
+    finalizing.rename(output_directory)
+    shutil.rmtree(staging)
     return Phase4Result(output_directory=output_directory, manifest=manifest)
+
+
+def construct_sft_dataset(
+    training_ready_directory: Path,
+    output_directory: Path,
+    tokenizer: ChatTokenizer,
+    config: Phase4Config | None = None,
+    *,
+    progress_every: int = 25_000,
+    progress_callback: ProgressCallback | None = None,
+) -> Phase4Result:
+    """Construct balanced prompt-completion shards with atomic resume checkpoints."""
+
+    if progress_every < 1:
+        raise ValueError("progress_every must be positive.")
+    active_config = config or Phase4Config()
+    config_hash = _config_sha256(active_config)
+    manifest_path = output_directory / "phase4-manifest.json"
+    phase3_manifest_path = training_ready_directory / "phase3-manifest.json"
+    if not phase3_manifest_path.is_file():
+        raise FileNotFoundError("Phase 3 training-ready manifest is missing.")
+    phase3_hash = _sha256(phase3_manifest_path)
+    if manifest_path.is_file():
+        manifest = Phase4Manifest.model_validate_json(manifest_path.read_text(encoding="utf-8"))
+        if manifest.config != active_config or manifest.phase3_manifest_sha256 != phase3_hash:
+            raise ValueError("Existing Phase 4 output used different inputs or configuration.")
+        return Phase4Result(output_directory=output_directory, manifest=manifest)
+    if output_directory.exists():
+        raise FileExistsError(f"Phase 4 output is incomplete or non-empty: {output_directory}")
+    staging = output_directory.with_name(f"{output_directory.name}.staging")
+    selection_path = staging / "selection-checkpoint.json"
+    if staging.exists() and not selection_path.is_file():
+        shutil.rmtree(staging)
+    staging.mkdir(parents=True, exist_ok=True)
+
+    phase3_manifest = Phase3Manifest.model_validate_json(
+        phase3_manifest_path.read_text(encoding="utf-8")
+    )
+    if phase3_manifest.tokenizer_id != active_config.model_id:
+        raise ValueError("Phase 3 tokenizer and Phase 4 model IDs do not match.")
+    if not _phase3_passed(phase3_manifest):
+        raise RuntimeError("Phase 3 integrity gates did not pass.")
+
+    route_root = training_ready_directory / "routing"
+    chunk_ids, chunk_route_count = _read_route_ids(route_root / "requires_chunking.jsonl")
+    if chunk_route_count != phase3_manifest.by_action.get("requires_chunking", 0):
+        raise RuntimeError("Phase 3 chunking route count does not match its manifest.")
+    selection = _load_or_create_selection(
+        staging,
+        training_ready_directory,
+        chunk_ids,
+        active_config,
+        config_hash,
+        phase3_hash,
+        progress_every,
+        progress_callback,
+    )
+    long_target_count = sum(
+        1
+        for line in (route_root / "long_target.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    )
+    if long_target_count != phase3_manifest.by_action.get("long_target", 0):
+        raise RuntimeError("Phase 3 long-target route count does not match its manifest.")
+    checkpoint = _load_or_create_build_checkpoint(staging, selection)
+    source_token_lengths = _load_source_token_lengths(
+        training_ready_directory,
+        set(selection.selected_record_ids),
+    )
+    checkpoint = _build_resumable_parts(
+        staging,
+        training_ready_directory,
+        chunk_ids,
+        selection,
+        checkpoint,
+        tokenizer,
+        active_config,
+        source_token_lengths,
+        progress_every,
+        progress_callback,
+    )
+    if progress_callback is not None:
+        progress_callback("finalize", checkpoint.completed_records)
+    return _assemble_parts(
+        staging,
+        output_directory,
+        training_ready_directory,
+        selection,
+        checkpoint,
+        phase3_manifest,
+        phase3_hash,
+        active_config,
+        long_target_count,
+    )

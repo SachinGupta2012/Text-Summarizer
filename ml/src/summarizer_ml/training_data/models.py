@@ -49,7 +49,11 @@ class Phase4Config(BaseModel):
     max_sequence_tokens: int = Field(default=4_096, ge=512)
     minimum_source_tokens: int = Field(default=128, ge=32)
     source_windows: int = Field(default=3, ge=1, le=5)
-    max_train_records_per_dataset: int = Field(default=50_000, ge=1)
+    source_budget_reserve_tokens: int = Field(default=64, ge=16, le=512)
+    source_fit_attempts: int = Field(default=3, ge=1, le=5)
+    max_train_records_per_dataset: int = Field(default=10_000, ge=1)
+    max_evaluation_records_per_dataset_split: int = Field(default=1_000, ge=1)
+    construction_batch_size: int = Field(default=64, ge=1, le=512)
     records_per_shard: int = Field(default=10_000, ge=100)
     sampling_seed: str = Field(default="qwen3-summarization-phase4-v1", min_length=1)
     prompt_version: str = Field(default="qwen3-summarization-v1", min_length=1)
@@ -136,7 +140,7 @@ class Phase4Manifest(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
-    schema_version: str = "1.0"
+    schema_version: str = "1.1"
     config: Phase4Config
     phase3_manifest_sha256: str
     candidate_records: int

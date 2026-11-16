@@ -146,6 +146,7 @@ def create_phase3_handoff(
                 and (
                     path == phase3_manifest_path
                     or "processed" in path.relative_to(training_ready).parts
+                    or "analysis" in path.relative_to(training_ready).parts
                     or path.parent == route_root
                 )
             )

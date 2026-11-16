@@ -6,6 +6,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import TextIO
 
+import pytest
 from summarizer_ml.preprocessing.models import (
     DatasetName,
     Domain,
@@ -68,13 +69,54 @@ class WordChatTokenizer:
         *,
         tokenize: bool,
         add_generation_prompt: bool,
-    ) -> list[int]:
-        if not tokenize:
-            raise AssertionError("Phase 4 must request tokenized chat templates.")
+    ) -> list[int] | str:
         parts = [f"<{message['role']}> {message['content']}" for message in conversation]
         if add_generation_prompt:
             parts.append("<assistant>")
-        return self.encode("\n".join(parts))
+        rendered = "\n".join(parts)
+        return self.encode(rendered) if tokenize else rendered
+
+    def __call__(
+        self,
+        text: list[str],
+        *,
+        add_special_tokens: bool = False,
+        padding: bool = False,
+        truncation: bool = False,
+    ) -> dict[str, object]:
+        del padding, truncation
+        return {
+            "input_ids": [
+                self.encode(value, add_special_tokens=add_special_tokens) for value in text
+            ]
+        }
+
+
+class InterruptingChatTokenizer(WordChatTokenizer):
+    """Fail on a chosen batch-tokenization call to exercise resume behavior."""
+
+    def __init__(self, fail_on_call: int) -> None:
+        super().__init__()
+        self.fail_on_call = fail_on_call
+        self.calls = 0
+
+    def __call__(
+        self,
+        text: list[str],
+        *,
+        add_special_tokens: bool = False,
+        padding: bool = False,
+        truncation: bool = False,
+    ) -> dict[str, object]:
+        self.calls += 1
+        if self.calls == self.fail_on_call:
+            raise RuntimeError("planned tokenizer interruption")
+        return super().__call__(
+            text,
+            add_special_tokens=add_special_tokens,
+            padding=padding,
+            truncation=truncation,
+        )
 
 
 class TensorLikeIds:
@@ -104,18 +146,35 @@ class TensorChatTokenizer:
     ) -> str:
         return self.base.decode(token_ids, skip_special_tokens=skip_special_tokens)
 
+    def __call__(
+        self,
+        text: list[str],
+        *,
+        add_special_tokens: bool = False,
+        padding: bool = False,
+        truncation: bool = False,
+    ) -> dict[str, object]:
+        return self.base(
+            text,
+            add_special_tokens=add_special_tokens,
+            padding=padding,
+            truncation=truncation,
+        )
+
     def apply_chat_template(
         self,
         conversation: list[dict[str, str]],
         *,
         tokenize: bool,
         add_generation_prompt: bool,
-    ) -> TensorLikeIds:
+    ) -> TensorLikeIds | str:
         values = self.base.apply_chat_template(
             conversation,
             tokenize=tokenize,
             add_generation_prompt=add_generation_prompt,
         )
+        if isinstance(values, str):
+            return values
         return TensorLikeIds(values)
 
 
@@ -136,18 +195,35 @@ class MappingChatTokenizer:
     ) -> str:
         return self.base.decode(token_ids, skip_special_tokens=skip_special_tokens)
 
+    def __call__(
+        self,
+        text: list[str],
+        *,
+        add_special_tokens: bool = False,
+        padding: bool = False,
+        truncation: bool = False,
+    ) -> dict[str, object]:
+        return self.base(
+            text,
+            add_special_tokens=add_special_tokens,
+            padding=padding,
+            truncation=truncation,
+        )
+
     def apply_chat_template(
         self,
         conversation: list[dict[str, str]],
         *,
         tokenize: bool,
         add_generation_prompt: bool,
-    ) -> dict[str, TensorLikeIds]:
+    ) -> dict[str, TensorLikeIds] | str:
         values = self.base.apply_chat_template(
             conversation,
             tokenize=tokenize,
             add_generation_prompt=add_generation_prompt,
         )
+        if isinstance(values, str):
+            return values
         return {"input_ids": TensorLikeIds(values)}
 
 
@@ -332,6 +408,7 @@ def test_construct_sft_dataset_balances_train_and_preserves_evaluation(
             domain=Domain.LEGAL_DOCUMENT,
         ),
         _processed("cnn-validation", split=Split.VALIDATION),
+        _processed("cnn-validation-2", split=Split.VALIDATION),
     ]
     routed = _processed(
         "report-routed",
@@ -367,8 +444,25 @@ def test_construct_sft_dataset_balances_train_and_preserves_evaluation(
         max_sequence_tokens=512,
         minimum_source_tokens=32,
         max_train_records_per_dataset=2,
+        max_evaluation_records_per_dataset_split=1,
+        construction_batch_size=2,
         records_per_shard=100,
     )
+    with pytest.raises(RuntimeError, match="planned tokenizer interruption"):
+        construct_sft_dataset(
+            training_ready,
+            output_directory,
+            InterruptingChatTokenizer(fail_on_call=3),
+            config,
+            progress_every=2,
+            progress_callback=lambda stage, count: progress.append((stage, count)),
+        )
+    checkpoint = json.loads(
+        (tmp_path / "phase4.staging" / "build-checkpoint.json").read_text(encoding="utf-8")
+    )
+    assert checkpoint["completed_records"] == 2
+
+    progress.clear()
     result = construct_sft_dataset(
         training_ready,
         output_directory,
@@ -378,10 +472,10 @@ def test_construct_sft_dataset_balances_train_and_preserves_evaluation(
         progress_callback=lambda stage, count: progress.append((stage, count)),
     )
 
-    assert result.manifest.candidate_records == 6
+    assert result.manifest.candidate_records == 7
     assert result.manifest.selected_records == 5
     assert result.manifest.generated_examples == 5
-    assert result.manifest.sampling_dropped_records == 1
+    assert result.manifest.sampling_dropped_records == 2
     assert result.manifest.phase3_long_target_exclusions == 1
     assert result.manifest.construction_exclusions == 0
     assert result.manifest.selected_by_dataset == {
@@ -393,12 +487,11 @@ def test_construct_sft_dataset_balances_train_and_preserves_evaluation(
     assert result.manifest.integrity.cross_split_leakage_findings == 0
     assert result.manifest.total_token_statistics.maximum <= 512
     assert progress == [
-        ("candidate_scan", 2),
-        ("candidate_scan", 4),
-        ("candidate_scan", 6),
-        ("example_build", 2),
+        ("candidate_resume", 7),
+        ("example_resume", 2),
         ("example_build", 4),
         ("example_build", 5),
+        ("finalize", 5),
     ]
     shard_lines = [
         line
@@ -419,7 +512,7 @@ def test_construct_sft_dataset_balances_train_and_preserves_evaluation(
 
     archive_path = tmp_path / "phase3-for-phase4.tar.gz"
     handoff = create_phase3_handoff(final_directory, archive_path)
-    assert handoff.manifest.training_ready_records == 5
+    assert handoff.manifest.training_ready_records == 6
     assert handoff.manifest.routed_source_records == 1
     assert handoff.archive_bytes > 0
     assert len(handoff.archive_sha256) == 64
