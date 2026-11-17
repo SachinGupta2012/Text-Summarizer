@@ -8,6 +8,7 @@ import importlib.metadata
 import json
 import math
 import os
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -88,6 +89,37 @@ def interval_steps(mode: Phase6RunMode, config: Phase6Config) -> int:
     if mode is Phase6RunMode.CALIBRATION:
         return config.calibration_steps
     return config.evaluation_steps
+
+
+def checkpoint_step(path: str | None) -> int:
+    """Read the optimizer step encoded by a standard Trainer checkpoint path."""
+
+    if path is None:
+        return 0
+    name = Path(path).name
+    if not name.startswith("checkpoint-"):
+        return 0
+    try:
+        return int(name.removeprefix("checkpoint-"))
+    except ValueError:
+        return 0
+
+
+def save_selected_adapter(trainer: Trainer, destination: Path) -> str:
+    """Materialize the best adapter without reloading it into GPU memory."""
+
+    best_checkpoint = trainer.state.best_model_checkpoint
+    if best_checkpoint is not None:
+        source = Path(best_checkpoint)
+        config_source = source / "adapter_config.json"
+        weights_source = source / "adapter_model.safetensors"
+        if config_source.is_file() and weights_source.is_file():
+            destination.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(config_source, destination / config_source.name)
+            shutil.copy2(weights_source, destination / weights_source.name)
+            return str(source)
+    trainer.save_model(str(destination))
+    return "final_model"
 
 
 def main() -> None:
@@ -197,7 +229,7 @@ def main() -> None:
         ),
         dataloader_persistent_workers=config.dataloader_workers > 0,
         dataloader_pin_memory=True,
-        load_best_model_at_end=True,
+        load_best_model_at_end=False,
         metric_for_best_model="eval_loss",
         greater_is_better=False,
         group_by_length=True,
@@ -228,6 +260,7 @@ def main() -> None:
         callbacks=callbacks,
     )
     last_checkpoint = get_last_checkpoint(str(checkpoint_directory))
+    resumed_completed_run = checkpoint_step(last_checkpoint) >= max_steps
     initial_evaluation_metrics = trainer.evaluate(metric_key_prefix="initial")
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats(local_rank)
@@ -239,7 +272,7 @@ def main() -> None:
     if trainer.is_world_process_zero():
         adapter_directory = output_directory / "adapter"
         tokenizer_directory = output_directory / "tokenizer"
-        trainer.save_model(str(adapter_directory))
+        selected_adapter_checkpoint = save_selected_adapter(trainer, adapter_directory)
         trainer.save_state()
         tokenizer.save_pretrained(tokenizer_directory)
         history_path = output_directory / "training-history.jsonl"
@@ -285,7 +318,10 @@ def main() -> None:
             "train_metrics": train_result.metrics,
             "evaluation_metrics": evaluation_metrics,
             "best_checkpoint": trainer.state.best_model_checkpoint,
+            "selected_adapter_checkpoint": selected_adapter_checkpoint,
             "resumed_from_checkpoint": last_checkpoint,
+            "resumed_completed_run": resumed_completed_run,
+            "throughput_reliable": not resumed_completed_run,
             "losses_finite": True,
             "adapter_directory": str(adapter_directory),
             "gpu_names": [torch.cuda.get_device_name(index) for index in range(world_size)],
