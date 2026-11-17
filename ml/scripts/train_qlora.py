@@ -91,6 +91,7 @@ def interval_steps(mode: Phase6RunMode, config: Phase6Config) -> int:
 
 
 def main() -> None:
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     arguments = parse_arguments()
     config = Phase6Config.model_validate_json(arguments.config.read_text(encoding="utf-8"))
     selection = Phase6SelectionManifest.model_validate_json(
@@ -228,6 +229,7 @@ def main() -> None:
     )
     last_checkpoint = get_last_checkpoint(str(checkpoint_directory))
     initial_evaluation_metrics = trainer.evaluate(metric_key_prefix="initial")
+    torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats(local_rank)
     train_result = trainer.train(resume_from_checkpoint=last_checkpoint)
     evaluation_metrics = trainer.evaluate()
