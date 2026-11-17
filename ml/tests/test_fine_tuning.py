@@ -271,7 +271,7 @@ def test_phase6_tokenization_masks_prompt_and_runtime_math() -> None:
     config = Phase6Config()
     assert gradient_accumulation_steps(config, world_size=2) == 8
     assert gradient_accumulation_steps(config, world_size=1) == 16
-    assert optimizer_steps(8_000, config, world_size=2) == 500
-    projection = project_runtime(20, 200, 500)
+    assert optimizer_steps(4_000, config, world_size=2) == 250
+    projection = project_runtime(10, 100, 250)
     assert projection.seconds_per_step == 10
-    assert projection.projected_hours == pytest.approx(5_000 / 3_600)
+    assert projection.projected_hours == pytest.approx(2_500 / 3_600)

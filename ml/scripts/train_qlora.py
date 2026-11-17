@@ -86,7 +86,7 @@ def interval_steps(mode: Phase6RunMode, config: Phase6Config) -> int:
     if mode is Phase6RunMode.SMOKE:
         return max(1, config.smoke_steps // 2)
     if mode is Phase6RunMode.CALIBRATION:
-        return max(1, config.calibration_steps // 2)
+        return config.calibration_steps
     return config.evaluation_steps
 
 
