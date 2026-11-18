@@ -1,5 +1,6 @@
 """Contracts for reproducible base and fine-tuned summarization benchmarks."""
 
+from enum import StrEnum
 from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -148,3 +149,107 @@ class Phase5Result(BaseModel):
 
     output_directory: Path
     report: Phase5Report
+
+
+class Phase7Stage(StrEnum):
+    """Bounded evaluation stages for the pilot adapter."""
+
+    SCREEN = "screen"
+    FULL = "full"
+
+
+class Phase7Decision(StrEnum):
+    """Action permitted by a Phase 7 comparison gate."""
+
+    STOP = "stop"
+    CONTINUE = "continue"
+    ACCEPT_PILOT = "accept_pilot"
+    REJECT_PILOT = "reject_pilot"
+
+
+class Phase7Config(BaseModel):
+    """Frozen staged-evaluation and acceptance policy."""
+
+    model_config = ConfigDict(frozen=True)
+
+    screen_records_per_dataset: int = Field(default=20, ge=5)
+    screening_seed: str = "qwen3-summarization-phase7-screen-v1"
+    inference_batch_size: int = Field(default=4, ge=1, le=16)
+    bootstrap_samples: int = Field(default=2_000, ge=200)
+    confidence_level: float = Field(default=0.95, gt=0.5, lt=1)
+    minimum_rouge_l_gain: float = Field(default=0.005, ge=0, le=1)
+    minimum_rouge2_gain: float = Field(default=0.003, ge=0, le=1)
+    minimum_bertscore_gain: float = Field(default=0.005, ge=0, le=1)
+    maximum_dataset_regression: float = Field(default=0.03, ge=0, le=1)
+
+
+class MetricDelta(BaseModel):
+    """Fine-tuned metric minus the paired base-model metric."""
+
+    model_config = ConfigDict(frozen=True)
+
+    rouge1_f1: float
+    rouge2_f1: float
+    rouge_l_f1: float
+    bertscore_f1: float | None
+    mean_prediction_tokens: float
+    mean_latency_seconds: float
+    empty_predictions: int
+    max_token_predictions: int
+
+
+class ConfidenceInterval(BaseModel):
+    """Deterministic paired-bootstrap interval for one metric delta."""
+
+    model_config = ConfigDict(frozen=True)
+
+    lower: float
+    point: float
+    upper: float
+
+
+class Phase7IntegrityGates(BaseModel):
+    """Identity and coverage checks for a paired comparison."""
+
+    model_config = ConfigDict(frozen=True)
+
+    frozen_selection_unchanged: bool
+    base_prediction_coverage_complete: bool
+    adapter_prediction_coverage_complete: bool
+    prediction_identities_match: bool
+    adapter_prediction_ids_unique: bool
+    evaluation_uses_only_held_out_splits: bool
+    adapter_empty_predictions: int = Field(ge=0)
+
+
+class Phase7Report(BaseModel):
+    """Paired base-versus-adapter report and automatic decision gate."""
+
+    model_config = ConfigDict(frozen=True)
+
+    schema_version: str = "1.0"
+    stage: Phase7Stage
+    config: Phase7Config
+    benchmark_selection_sha256: str
+    base_predictions_sha256: str
+    adapter_sha256: str
+    records: int
+    records_by_dataset: dict[str, int]
+    base_overall: MetricSummary
+    adapter_overall: MetricSummary
+    overall_delta: MetricDelta
+    by_dataset_delta: dict[str, MetricDelta]
+    paired_intervals: dict[str, ConfidenceInterval]
+    decision: Phase7Decision
+    decision_reasons: tuple[str, ...]
+    integrity: Phase7IntegrityGates
+    adapter_predictions_path: Path
+
+
+class Phase7Result(BaseModel):
+    """Paths and final report returned by Phase 7 evaluation."""
+
+    model_config = ConfigDict(frozen=True)
+
+    output_directory: Path
+    report: Phase7Report

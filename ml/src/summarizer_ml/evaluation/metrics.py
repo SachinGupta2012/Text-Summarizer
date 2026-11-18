@@ -66,6 +66,25 @@ def _mean(values: Sequence[float | int]) -> float:
     return float(sum(values) / len(values)) if values else 0.0
 
 
+def prediction_pair_metrics(
+    example: BenchmarkExample,
+    prediction: BaselinePrediction,
+    bertscore_f1: float | None = None,
+) -> dict[str, float]:
+    """Calculate per-record quality values used by paired comparisons."""
+
+    predicted = _tokens(prediction.prediction)
+    reference = _tokens(example.reference_summary)
+    values = {
+        "rouge1_f1": _ngram_f1(predicted, reference, 1),
+        "rouge2_f1": _ngram_f1(predicted, reference, 2),
+        "rouge_l_f1": _rouge_l_f1(predicted, reference),
+    }
+    if bertscore_f1 is not None:
+        values["bertscore_f1"] = bertscore_f1
+    return values
+
+
 def _summarize(
     pairs: Sequence[tuple[BenchmarkExample, BaselinePrediction]],
     bertscore: Mapping[str, float] | None,
@@ -81,13 +100,16 @@ def _summarize(
     empty = 0
     max_token_predictions = 0
     for example, prediction in pairs:
-        predicted = _tokens(prediction.prediction)
-        reference = _tokens(example.reference_summary)
-        rouge1.append(_ngram_f1(predicted, reference, 1))
-        rouge2.append(_ngram_f1(predicted, reference, 2))
-        rouge_l.append(_rouge_l_f1(predicted, reference))
-        if bertscore is not None:
-            semantic.append(bertscore[example.record_id])
+        values = prediction_pair_metrics(
+            example,
+            prediction,
+            bertscore[example.record_id] if bertscore is not None else None,
+        )
+        rouge1.append(values["rouge1_f1"])
+        rouge2.append(values["rouge2_f1"])
+        rouge_l.append(values["rouge_l_f1"])
+        if "bertscore_f1" in values:
+            semantic.append(values["bertscore_f1"])
         prediction_tokens.append(prediction.generated_tokens)
         reference_tokens.append(example.reference_tokens)
         latencies.append(prediction.latency_seconds)
@@ -105,6 +127,27 @@ def _summarize(
         empty_predictions=empty,
         max_token_predictions=max_token_predictions,
     )
+
+
+def summarize_predictions(
+    selection: Sequence[BenchmarkExample],
+    predictions: Sequence[BaselinePrediction],
+    *,
+    bertscore: Mapping[str, float] | None,
+    max_new_tokens: int,
+) -> MetricSummary:
+    """Summarize one model on an identity-checked benchmark selection."""
+
+    selected = {example.record_id: example for example in selection}
+    predicted = {prediction.record_id: prediction for prediction in predictions}
+    if len(selected) != len(selection) or len(predicted) != len(predictions):
+        raise ValueError("Selection and predictions must contain unique record IDs.")
+    if set(selected) != set(predicted):
+        raise ValueError("Prediction coverage does not match the benchmark selection.")
+    if bertscore is not None and set(bertscore) != set(selected):
+        raise ValueError("BERTScore coverage does not match the benchmark selection.")
+    pairs = tuple((example, predicted[example.record_id]) for example in selection)
+    return _summarize(pairs, bertscore, max_new_tokens)
 
 
 def evaluate_baseline(

@@ -211,10 +211,12 @@ def load_benchmark_selection(path: Path) -> tuple[BenchmarkExample, ...]:
     return tuple(examples)
 
 
-def _load_predictions(path: Path) -> dict[str, BaselinePrediction]:
+def load_predictions(path: Path) -> tuple[BaselinePrediction, ...]:
+    """Load a prediction checkpoint while enforcing unique record IDs."""
+
     predictions: dict[str, BaselinePrediction] = {}
     if not path.is_file():
-        return predictions
+        return ()
     with path.open(encoding="utf-8") as source_file:
         for line_number, line in enumerate(source_file, start=1):
             if not line.strip():
@@ -226,7 +228,11 @@ def _load_predictions(path: Path) -> dict[str, BaselinePrediction]:
             if prediction.record_id in predictions:
                 raise ValueError("Prediction checkpoint contains duplicate record IDs.")
             predictions[prediction.record_id] = prediction
-    return predictions
+    return tuple(predictions.values())
+
+
+def _load_prediction_map(path: Path) -> dict[str, BaselinePrediction]:
+    return {prediction.record_id: prediction for prediction in load_predictions(path)}
 
 
 def generate_baseline_predictions(
@@ -237,6 +243,7 @@ def generate_baseline_predictions(
     *,
     progress_every: int = 25,
     progress_callback: ProgressCallback | None = None,
+    allow_checkpoint_superset: bool = False,
 ) -> tuple[BaselinePrediction, ...]:
     """Generate missing predictions and resume safely from an append-only checkpoint."""
 
@@ -245,9 +252,9 @@ def generate_baseline_predictions(
     selected_by_id = {example.record_id: example for example in selection}
     if len(selected_by_id) != len(selection):
         raise ValueError("Benchmark selection contains duplicate record IDs.")
-    existing = _load_predictions(predictions_path)
+    existing = _load_prediction_map(predictions_path)
     unexpected = set(existing).difference(selected_by_id)
-    if unexpected:
+    if unexpected and not allow_checkpoint_superset:
         raise ValueError("Prediction checkpoint contains records outside the selection.")
     predictions_path.parent.mkdir(parents=True, exist_ok=True)
     completed = len(existing)
@@ -289,7 +296,7 @@ def generate_baseline_predictions(
                 completed == total or completed % progress_every < len(batch)
             ):
                 progress_callback("generation", completed, total)
-    if set(existing) != set(selected_by_id):
+    if not set(selected_by_id).issubset(existing):
         raise RuntimeError("Baseline prediction coverage is incomplete.")
     return tuple(existing[example.record_id] for example in selection)
 
@@ -313,7 +320,7 @@ def regenerate_capped_predictions(
     selected_by_id = {example.record_id: example for example in selection}
     if len(selected_by_id) != len(selection):
         raise ValueError("Benchmark selection contains duplicate record IDs.")
-    existing = _load_predictions(predictions_path)
+    existing = _load_prediction_map(predictions_path)
     if set(existing) != set(selected_by_id):
         raise RuntimeError("Capped repair requires complete baseline prediction coverage.")
     identity_matches = all(
