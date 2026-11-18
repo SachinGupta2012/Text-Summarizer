@@ -253,3 +253,118 @@ class Phase7Result(BaseModel):
 
     output_directory: Path
     report: Phase7Report
+
+
+class Phase8PolicyDecision(StrEnum):
+    """Generation policy selected after capped-output repair."""
+
+    EXTENDED_LIMIT = "extended_limit"
+    ORIGINAL_LIMIT_WITH_CHUNKING_ROUTE = "original_limit_with_chunking_route"
+
+
+class Phase8Config(BaseModel):
+    """Frozen capped-output audit, repair, and packaging policy."""
+
+    model_config = ConfigDict(frozen=True)
+
+    original_max_new_tokens: int = Field(default=1_024, ge=64)
+    candidate_max_new_tokens: int = Field(default=1_536, ge=64)
+    inference_batch_size: int = Field(default=2, ge=1, le=8)
+    maximum_quality_regression: float = Field(default=0.005, ge=0, le=1)
+    repetition_ngram_size: int = Field(default=4, ge=2, le=8)
+    repetition_fraction_threshold: float = Field(default=0.20, ge=0, le=1)
+    qualitative_records_per_dataset: int = Field(default=5, ge=1, le=20)
+    direct_input_token_limit: int = Field(default=4_096, ge=512)
+
+    @model_validator(mode="after")
+    def validate_limits(self) -> "Phase8Config":
+        if self.candidate_max_new_tokens <= self.original_max_new_tokens:
+            raise ValueError("Candidate generation limit must exceed the original limit.")
+        return self
+
+
+class CapAuditSummary(BaseModel):
+    """Aggregate capped-output and repetition diagnostics."""
+
+    model_config = ConfigDict(frozen=True)
+
+    records: int
+    token_limit: int
+    capped_records: int
+    capped_rate: float = Field(ge=0, le=1)
+    capped_by_dataset: dict[str, int]
+    incomplete_endings: int = Field(ge=0)
+    high_repetition_records: int = Field(ge=0)
+    mean_output_to_prompt_ratio: float = Field(ge=0)
+    audit_records_path: Path
+
+
+class GenerationPolicy(BaseModel):
+    """Runtime generation contract frozen with the selected adapter."""
+
+    model_config = ConfigDict(frozen=True)
+
+    schema_version: str = "1.0"
+    model_id: str
+    adapter_sha256: str
+    do_sample: bool = False
+    max_new_tokens: int
+    direct_input_token_limit: int
+    route_to_chunking_on_token_limit: bool = True
+    policy_decision: Phase8PolicyDecision
+
+
+class Phase8IntegrityGates(BaseModel):
+    """Acceptance gates for final model packaging."""
+
+    model_config = ConfigDict(frozen=True)
+
+    phase7_adapter_identity_matches: bool
+    original_prediction_coverage_complete: bool
+    repair_coverage_complete: bool
+    final_prediction_coverage_complete: bool
+    benchmark_identity_preserved: bool
+    final_empty_predictions: int = Field(ge=0)
+    remaining_caps_routed: bool
+    final_comparison_accepted: bool
+
+
+class Phase8Report(BaseModel):
+    """Final generation-policy selection and model-package report."""
+
+    model_config = ConfigDict(frozen=True)
+
+    schema_version: str = "1.0"
+    config: Phase8Config
+    adapter_sha256: str
+    phase7_report_sha256: str
+    records: int
+    repaired_records: int
+    original_audit: CapAuditSummary
+    candidate_audit: CapAuditSummary
+    original_metrics: MetricSummary
+    candidate_metrics: MetricSummary
+    selected_metrics: MetricSummary
+    candidate_delta_from_original: MetricDelta
+    policy_decision: Phase8PolicyDecision
+    policy_reasons: tuple[str, ...]
+    final_comparison_decision: Phase7Decision
+    remaining_caps: int
+    remaining_caps_by_dataset: dict[str, int]
+    integrity: Phase8IntegrityGates
+    final_predictions_path: Path
+    chunking_route_path: Path
+    generation_policy_path: Path
+
+
+class ModelPackageManifest(BaseModel):
+    """Immutable file inventory for the deployable adapter package."""
+
+    model_config = ConfigDict(frozen=True)
+
+    schema_version: str = "1.0"
+    model_id: str
+    model_revision: str
+    adapter_sha256: str
+    phase8_report_sha256: str
+    files: dict[str, str]

@@ -136,7 +136,9 @@ def merge_prediction_shards(
     return ordered
 
 
-def _delta(base: MetricSummary, adapter: MetricSummary) -> MetricDelta:
+def metric_delta(base: MetricSummary, adapter: MetricSummary) -> MetricDelta:
+    """Return candidate-minus-base deltas for aggregate metrics."""
+
     bertscore_delta = None
     if base.bertscore_f1 is not None and adapter.bertscore_f1 is not None:
         bertscore_delta = adapter.bertscore_f1 - base.bertscore_f1
@@ -345,9 +347,9 @@ def evaluate_adapter_comparison(
             bertscore={key: adapter_bertscore[key] for key in dataset_ids},
             max_new_tokens=max_new_tokens,
         )
-        by_dataset_delta[dataset] = _delta(base_dataset_summary, adapter_dataset_summary)
+        by_dataset_delta[dataset] = metric_delta(base_dataset_summary, adapter_dataset_summary)
 
-    overall_delta = _delta(base_summary, adapter_summary)
+    overall_delta = metric_delta(base_summary, adapter_summary)
     intervals = _paired_intervals(
         evaluated_selection,
         base_by_id,

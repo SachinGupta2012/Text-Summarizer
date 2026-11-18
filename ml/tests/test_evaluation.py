@@ -14,11 +14,16 @@ from summarizer_ml.evaluation import (
     Phase7Config,
     Phase7Decision,
     Phase7Stage,
+    Phase8Config,
+    Phase8PolicyDecision,
+    create_model_package,
     evaluate_adapter_comparison,
     evaluate_baseline,
+    finalize_phase8,
     generate_baseline_predictions,
     load_benchmark_selection,
     merge_prediction_shards,
+    overlay_repairs,
     prepare_benchmark_selection,
     regenerate_capped_predictions,
     select_phase7_examples,
@@ -348,3 +353,117 @@ def test_phase7_screen_shards_and_paired_acceptance(tmp_path: Path) -> None:
     assert result.report.overall_delta.rouge_l_f1 > 0
     assert result.report.integrity.adapter_prediction_coverage_complete
     assert (phase7 / "screen-comparison-report.json").is_file()
+
+
+def test_phase8_repairs_caps_selects_policy_and_packages_adapter(tmp_path: Path) -> None:
+    phase4 = tmp_path / "phase4"
+    phase5 = tmp_path / "phase5"
+    phase7 = tmp_path / "phase7"
+    phase8 = tmp_path / "phase8"
+    adapter_directory = tmp_path / "pilot" / "adapter"
+    tokenizer_directory = tmp_path / "pilot" / "tokenizer"
+    adapter_directory.mkdir(parents=True)
+    tokenizer_directory.mkdir(parents=True)
+    adapter_path = adapter_directory / "adapter_model.safetensors"
+    adapter_path.write_bytes(b"adapter")
+    (adapter_directory / "adapter_config.json").write_text("{}", encoding="utf-8")
+    (tokenizer_directory / "tokenizer_config.json").write_text("{}", encoding="utf-8")
+
+    _write_phase4(phase4)
+    phase5_config = Phase5Config(
+        benchmark_records_per_dataset=10,
+        inference_batch_size=4,
+    )
+    manifest = prepare_benchmark_selection(phase4, phase5, phase5_config)
+    selection = load_benchmark_selection(manifest.selection_path)
+    base_predictions = tuple(_prediction(item, "unrelated output") for item in selection)
+    original_predictions = tuple(
+        _prediction(item, item.reference_summary).model_copy(update={"generated_tokens": 1_024})
+        for item in selection
+    )
+    repaired_predictions = tuple(
+        _prediction(item, f"{item.reference_summary}.").model_copy(
+            update={
+                "generated_tokens": item.reference_tokens + 1,
+                "generation_max_new_tokens": 1_536,
+            }
+        )
+        for item in selection
+    )
+    base_path = phase5 / "base-predictions.jsonl"
+    base_path.write_text(
+        "".join(item.model_dump_json() + "\n" for item in base_predictions),
+        encoding="utf-8",
+    )
+    original_path = phase7 / "pilot-predictions.jsonl"
+    original_path.parent.mkdir(parents=True)
+    original_path.write_text(
+        "".join(item.model_dump_json() + "\n" for item in original_predictions),
+        encoding="utf-8",
+    )
+    phase7_config = Phase7Config(bootstrap_samples=200)
+    record_ids = {item.record_id for item in selection}
+    phase7_result = evaluate_adapter_comparison(
+        selection,
+        selection,
+        base_predictions,
+        original_predictions,
+        {record_id: 0.1 for record_id in record_ids},
+        {record_id: 0.8 for record_id in record_ids},
+        phase7,
+        phase7_config,
+        Phase7Stage.FULL,
+        max_new_tokens=1_024,
+        benchmark_selection_path=manifest.selection_path,
+        base_predictions_path=base_path,
+        adapter_path=adapter_path,
+        adapter_predictions_path=original_path,
+    )
+    phase7_report_path = phase7 / "full-comparison-report.json"
+    candidate_path = phase8 / "candidate-predictions.jsonl"
+    candidate = overlay_repairs(
+        selection,
+        original_predictions,
+        repaired_predictions,
+        tuple(record_ids),
+        candidate_path,
+    )
+
+    report = finalize_phase8(
+        selection,
+        base_predictions,
+        original_predictions,
+        candidate,
+        {record_id: 0.1 for record_id in record_ids},
+        {record_id: 0.8 for record_id in record_ids},
+        {record_id: 0.8 for record_id in record_ids},
+        phase7_result.report,
+        phase8,
+        Phase8Config(),
+        benchmark_selection_path=manifest.selection_path,
+        base_predictions_path=base_path,
+        adapter_path=adapter_path,
+        phase7_report_path=phase7_report_path,
+        model_id=phase5_config.model_id,
+    )
+    assert report.policy_decision is Phase8PolicyDecision.EXTENDED_LIMIT
+    assert report.repaired_records == len(selection)
+    assert report.candidate_audit.capped_records == 0
+    assert report.remaining_caps == 0
+    assert report.integrity.final_comparison_accepted
+
+    package_directory = phase8 / "package"
+    archive_path = phase8 / "qwen3-summarizer-adapter-v1.tar.gz"
+    package_manifest = create_model_package(
+        adapter_directory,
+        tokenizer_directory,
+        phase8 / "generation-policy.json",
+        phase8 / "phase8-final-report.json",
+        package_directory,
+        archive_path,
+        model_id=phase5_config.model_id,
+        model_revision="test-revision",
+    )
+    assert package_manifest.adapter_sha256
+    assert archive_path.is_file()
+    assert (package_directory / "model-manifest.json").is_file()
